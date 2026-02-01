@@ -1,0 +1,442 @@
+-- autobuy.lua
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players          = game:GetService("Players")
+
+local DataService      = require(ReplicatedStorage.Modules.DataService)
+local SeedShopData     = require(ReplicatedStorage.Data.SeedShopData)
+local PetEggData       = require(ReplicatedStorage.Data.PetEggData)
+local GearShopDataRaw  = require(ReplicatedStorage.Data.GearShopData)
+
+local BuySeedStock     = ReplicatedStorage.GameEvents.BuySeedStock
+local BuyPetEgg        = ReplicatedStorage.GameEvents.BuyPetEgg
+local BuyGearStock     = ReplicatedStorage.GameEvents.BuyGearStock
+
+local GearShopData     = GearShopDataRaw.Gear or GearShopDataRaw
+
+local M = {}
+
+-- =========================================================
+-- DEBUG (AMAN, TIDAK SPAM TABLE)
+-- =========================================================
+local DEBUG = false
+local function dprint(...)
+    if DEBUG then print("[AutoBuy]", ...) end
+end
+local function dwarn(...)
+    if DEBUG then warn("[AutoBuy]", ...) end
+end
+
+local function sampleKey(t)
+    if type(t) ~= "table" then return nil end
+    for k, v in pairs(t) do
+        return k, v
+    end
+    return nil
+end
+
+do
+    dprint("Module load, DEBUG=", DEBUG)
+    local sk = sampleKey(SeedShopData)
+    local ek = sampleKey(PetEggData)
+    local gk = sampleKey(GearShopData)
+    dprint("SeedShopData sample key:", sk)
+    dprint("PetEggData sample key:", ek)
+    dprint("GearShopData sample key:", gk)
+end
+
+-- =========================================================
+-- GLOBAL-FACING (yang dipakai UI + state.lua)
+-- =========================================================
+AUTO_BUY_SEED_ENABLED = (AUTO_BUY_SEED_ENABLED == true)
+AUTO_BUY_EGG_ENABLED  = (AUTO_BUY_EGG_ENABLED  == true)
+AUTO_BUY_GEAR_ENABLED = (AUTO_BUY_GEAR_ENABLED == true)
+
+SEED_SELECTED = SEED_SELECTED or {} -- map [name]=true
+EGG_SELECTED  = EGG_SELECTED  or {}
+GEAR_SELECTED = GEAR_SELECTED or {}
+
+-- =========================================================
+-- INFO TABLE (dipakai tick)
+-- =========================================================
+local SEED_INFO = {}   -- [name] = { price, currency, rebirth }
+local EGG_INFO  = {}   -- [name] = { price, currency, rebirth, index }
+local GEAR_INFO = {}   -- [name] = { price, currency, rebirth }
+
+local SeedItems, EggItems, GearItems = nil, nil, nil
+local EGG_INDEX_BY_NAME = nil
+
+local function sortByLayoutOrder(dataTbl, names)
+    table.sort(names, function(a, b)
+        local ra = dataTbl[a]
+        local rb = dataTbl[b]
+        local ia = (type(ra) == "table" and (ra.LayoutOrder or 0)) or 0
+        local ib = (type(rb) == "table" and (rb.LayoutOrder or 0)) or 0
+        if ia == ib then return tostring(a) < tostring(b) end
+        return ia < ib
+    end)
+end
+
+-- =========================================================
+-- BUILD LISTS (âœ… RETURN STRING LIST!)
+-- =========================================================
+local function buildSeedList()
+    table.clear(SEED_INFO)
+    local names = {}
+
+    for name, info in pairs(SeedShopData) do
+        if type(info) == "table" and info.DisplayInShop ~= false then
+            local currencyType = info.SpecialCurrencyType or "Sheckles"
+            local price        = info.Price or info.FallbackPrice or 0
+            local rebirthReq   = info.RebirthRequirement or 0
+
+            SEED_INFO[name] = {
+                price    = price,
+                currency = currencyType,
+                rebirth  = rebirthReq,
+            }
+            names[#names+1] = name
+        end
+    end
+
+    sortByLayoutOrder(SeedShopData, names)
+    dprint("buildSeedList:", #names, "sample:", names[1])
+    return names
+end
+
+local function buildEggList()
+    table.clear(EGG_INFO)
+    EGG_INDEX_BY_NAME = {}
+
+    local tmp = {}
+    for name, info in pairs(PetEggData) do
+        if type(info) == "table" then
+            tmp[#tmp+1] = { name = name, order = info.LayoutOrder or 0 }
+        end
+    end
+
+    table.sort(tmp, function(a, b)
+        if a.order == b.order then return a.name < b.name end
+        return a.order < b.order
+    end)
+
+    local names = {}
+    for idx, rec in ipairs(tmp) do
+        local info = PetEggData[rec.name]
+        local price      = info.Price or info.FallbackPrice or 0
+        local currency   = info.SpecialCurrencyType or "Sheckles"
+        local rebirthReq = info.RebirthRequirement or 0
+
+        names[idx] = rec.name
+        EGG_INDEX_BY_NAME[rec.name] = idx
+
+        EGG_INFO[rec.name] = {
+            price    = price,
+            currency = currency,
+            rebirth  = rebirthReq,
+            index    = idx,
+        }
+    end
+
+    dprint("buildEggList:", #names, "sample:", names[1])
+    return names
+end
+
+local function buildGearList()
+    table.clear(GEAR_INFO)
+    local names = {}
+
+    for name, info in pairs(GearShopData) do
+        if type(info) == "table" and info.DisplayInShop ~= false then
+            local currencyType = info.SpecialCurrencyType or "Sheckles"
+            local price        = info.Price or info.FallbackPrice or 0
+            local rebirthReq   = info.RebirthRequirement or 0
+
+            GEAR_INFO[name] = {
+                price    = price,
+                currency = currencyType,
+                rebirth  = rebirthReq,
+            }
+            names[#names+1] = name
+        end
+    end
+
+    sortByLayoutOrder(GearShopData, names)
+    dprint("buildGearList:", #names, "sample:", names[1])
+    return names
+end
+
+local function ensureListsBuilt()
+    if not SeedItems then
+        local ok, res = pcall(buildSeedList)
+        SeedItems = (ok and type(res) == "table") and res or {}
+        if not ok then dwarn("buildSeedList error:", res) end
+    end
+    if not EggItems then
+        local ok, res = pcall(buildEggList)
+        EggItems = (ok and type(res) == "table") and res or {}
+        if not ok then dwarn("buildEggList error:", res) end
+    end
+    if not GearItems then
+        local ok, res = pcall(buildGearList)
+        GearItems = (ok and type(res) == "table") and res or {}
+        if not ok then dwarn("buildGearList error:", res) end
+    end
+
+    dprint("ensureListsBuilt -> seed", #SeedItems, "egg", #EggItems, "gear", #GearItems)
+end
+
+function M.GetLists()
+    ensureListsBuilt()
+    return SeedItems, EggItems, GearItems
+end
+
+-- =========================================================
+-- SHOP_INFO / STATE SYNC
+-- =========================================================
+STATE = STATE or {}
+dprint("STATE at load:", STATE)
+
+local SHOP_INFO = {
+    seed = {
+        infoTable = SEED_INFO,
+        stockPath = "SeedStocks",
+        buyFn     = function(name, qty)
+            dprint("BUY seed", name, "qty", qty)
+            for i = 1, qty do
+                if not STATE.autoBuySeeds then break end
+                BuySeedStock:FireServer("Shop", name)
+                task.wait(0.15)
+            end
+        end,
+    },
+    egg = {
+        infoTable = EGG_INFO,
+        stockPath = "PetEggStock",
+        buyFn     = function(name, qty)
+            if not EGG_INDEX_BY_NAME then buildEggList() end
+            local idx = EGG_INDEX_BY_NAME and EGG_INDEX_BY_NAME[name]
+            if not idx then
+                dwarn("Egg index not found for:", name)
+                return
+            end
+
+            dprint("BUY egg", name, "idx", idx, "qty", qty)
+            for i = 1, qty do
+                if not STATE.autoBuyEgg then break end
+                BuyPetEgg:FireServer(idx)
+                task.wait(0.15)
+            end
+        end,
+    },
+    gear = {
+        infoTable = GEAR_INFO,
+        stockPath = "GearStock",
+        buyFn     = function(name, qty)
+            dprint("BUY gear", name, "qty", qty)
+            for i = 1, qty do
+                if not STATE.autoBuyGear then break end
+                BuyGearStock:FireServer(name)
+                task.wait(0.15)
+            end
+        end,
+    },
+}
+
+function M.GetShopInfo()
+    ensureListsBuilt()
+    return SHOP_INFO
+end
+
+function M.SyncFromGlobals()
+    ensureListsBuilt()
+
+    STATE.autoBuySeeds = (AUTO_BUY_SEED_ENABLED == true)
+    STATE.autoBuyEgg   = (AUTO_BUY_EGG_ENABLED  == true)
+    STATE.autoBuyGear  = (AUTO_BUY_GEAR_ENABLED == true)
+
+    SHOP_INFO.seed.selected = SEED_SELECTED or {}
+    SHOP_INFO.egg.selected  = EGG_SELECTED  or {}
+    SHOP_INFO.gear.selected = GEAR_SELECTED or {}
+
+    dprint("SyncFromGlobals:", STATE.autoBuySeeds, STATE.autoBuyEgg, STATE.autoBuyGear)
+end
+
+-- =========================================================
+-- Tick logic (tetap seperti punyamu)
+-- =========================================================
+local function getStockAmount(entry)
+    if entry == nil then return 0 end
+    if type(entry) == "number" then return entry end
+    if type(entry) == "table" then return entry.Stock or 0 end
+    return 0
+end
+
+local function getSheckles(profile)
+    if not profile then return 0 end
+    if type(profile.Sheckles) == "number" then return profile.Sheckles end
+    if type(profile.CurrencyData) == "table" and type(profile.CurrencyData.Sheckles) == "number" then
+        return profile.CurrencyData.Sheckles
+    end
+    if type(profile.Stats) == "table" and type(profile.Stats.Sheckles) == "number" then
+        return profile.Stats.Sheckles
+    end
+    return 0
+end
+
+local function getGardenCoins(profile)
+    if not profile then return 0 end
+    if type(profile.GardenCoins) == "number" then return profile.GardenCoins end
+    if type(profile.CurrencyData) == "table" and type(profile.CurrencyData.GardenCoins) == "number" then
+        return profile.CurrencyData.GardenCoins
+    end
+    if type(profile.Stats) == "table" and type(profile.Stats.GardenCoins) == "number" then
+        return profile.Stats.GardenCoins
+    end
+    return 0
+end
+
+function M.Tick()
+    M.SyncFromGlobals()
+
+    local profile = DataService:GetData()
+    
+    if not profile then
+        dwarn("Tick: DataService:GetData() returned nil")
+        return
+    end
+
+    local sheckles    = getSheckles(profile)
+    local gardenCoins = getGardenCoins(profile)
+    dprint("Tick balances:", "Sheckles", sheckles, "GardenCoins", gardenCoins)
+
+    for catKey, cfg in pairs(SHOP_INFO) do
+        local categoryOn = false
+        if catKey == "seed" then categoryOn = STATE.autoBuySeeds
+        elseif catKey == "egg" then categoryOn = STATE.autoBuyEgg
+        elseif catKey == "gear" then categoryOn = STATE.autoBuyGear end
+        if not categoryOn then
+            continue
+        end
+
+        ensureListsBuilt()
+
+        if catKey == "egg" then
+            local stockRoot = profile[cfg.stockPath]
+            local stocks = stockRoot and stockRoot.Stocks
+            if typeof(stocks) ~= "table" then
+                dwarn("Egg stocks not table:", typeof(stocks))
+                continue
+            end
+
+            local selected = cfg.selected or {}
+            local hasSelected = false
+            for _, on in pairs(selected) do if on then hasSelected = true break end end
+
+            for idx, eggRec in ipairs(stocks) do
+                if type(eggRec) == "table" then
+                    local name = eggRec.EggName
+                    local stockCount = tonumber(eggRec.Stock) or 0
+                    local priceType = eggRec.PriceType
+
+                    local allowed = true
+                    if stockCount <= 0 then allowed = false end
+                    if allowed and priceType == "Robux" then allowed = false end
+                    if allowed and hasSelected and not selected[name] then allowed = false end
+
+                    if allowed then
+                        dprint("Egg allowed:", idx, name, "stock", stockCount, "priceType", tostring(priceType))
+                        for i = 1, stockCount do
+                            if not STATE.autoBuyEgg then break end
+                            BuyPetEgg:FireServer(idx)
+                            task.wait(0.15)
+                        end
+                    end
+                end
+            end
+        else
+            local infoTable = cfg.infoTable
+            local stockRoot = profile[cfg.stockPath]
+            local rawStocks
+
+            if catKey == "seed" then
+                rawStocks = stockRoot and stockRoot.Shop and stockRoot.Shop.Stocks
+            else
+                rawStocks = stockRoot and stockRoot.Stocks
+            end
+
+            if typeof(rawStocks) ~= "table" then
+                dwarn(catKey, "rawStocks not table:", typeof(rawStocks))
+                continue
+            end
+
+            local stockTable = {}
+            for key, entry in pairs(rawStocks) do
+                stockTable[key] = getStockAmount(entry)
+            end
+
+            local selected = cfg.selected or {}
+            local hasSelected = false
+            for _, on in pairs(selected) do if on then hasSelected = true break end end
+
+            local function processItem(name)
+                local info = infoTable[name]
+                if not info then return end
+
+                local currency = info.currency or "Sheckles"
+                local price    = info.price or 0
+                if price <= 0 then return end
+
+                local balance    = (currency == "GardenCoins") and gardenCoins or sheckles
+                local stockCount = stockTable[name] or 0
+                if stockCount <= 0 then return end
+                if balance < price then return end
+
+                dprint("Process", catKey, name, "stock", stockCount, "price", price, "cur", currency)
+                cfg.buyFn(name, stockCount)
+            end
+
+            if hasSelected then
+                for name, on in pairs(selected) do
+                    if on then processItem(name) end
+                end
+            else
+                for name, _ in pairs(infoTable) do
+                    processItem(name)
+                end
+            end
+        end
+    end
+end
+
+-- =========================================
+-- LOOP RUNNER
+-- =========================================
+local RUNNING = false
+
+function M.Start()
+    if RUNNING then return end
+    RUNNING = true
+    dprint("Start() loop running")
+
+    task.spawn(function()
+        while RUNNING do
+            local ok, err = pcall(M.Tick)
+            if not ok then
+                dwarn("Tick error:", err)
+            end
+            task.wait(5) -- interval beli
+        end
+    end)
+end
+
+function M.Stop()
+    RUNNING = false
+    dprint("Stop() loop stopped")
+end
+
+function M.IsRunning()
+    return RUNNING
+end
+
+
+return M

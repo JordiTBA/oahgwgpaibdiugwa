@@ -1,0 +1,706 @@
+-- main.lua (versi fast-load)
+----------------------------------------------------------------
+-- MINI LOADER (Battery Charging) - NodeHub (Black/Neon Yellow)
+-- taruh di paling atas main.lua
+----------------------------------------------------------------
+task.wait(5)
+local G = (getgenv and getgenv()) or _G
+if G.__NODEHUB_MAIN_RUNNING then
+    --warn("[NodeHub] main.lua BLOCKED (already running)")
+    return
+end
+G.__NODEHUB_MAIN_RUNNING = true
+
+local Players      = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local RunService   = game:GetService("RunService")
+local CoreGui      = game:GetService("CoreGui")
+
+local LP = Players.LocalPlayer
+
+local function _protect(gui)
+    -- beberapa executor perlu protectgui
+    pcall(function()
+        if syn and syn.protect_gui then syn.protect_gui(gui) end
+    end)
+end
+
+local function CreateMiniLoader(total)
+    total = tonumber(total) or 1
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "NodeHubMiniLoader"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+    _protect(gui)
+    pcall(function() gui.Parent = CoreGui end)
+    if not gui.Parent then
+        local pg = LP:FindFirstChildOfClass("PlayerGui") or LP:WaitForChild("PlayerGui")
+        gui.Parent = pg
+    end
+
+    local root = Instance.new("Frame")
+    root.Name = "Root"
+    root.AnchorPoint = Vector2.new(0.5, 0.5)
+    root.Position = UDim2.fromScale(0.5, 0.5)
+    root.Size = UDim2.fromOffset(360, 120)
+    root.BackgroundColor3 = Color3.fromRGB(0, 0, 0) -- ✅ hitam pekat
+    root.BackgroundTransparency = 0
+    root.BorderSizePixel = 0
+    root.Parent = gui
+
+    local rc = Instance.new("UICorner")
+    rc.CornerRadius = UDim.new(0, 14)
+    rc.Parent = root
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Thickness = 2
+    stroke.Transparency = 0.10
+    stroke.Color = Color3.fromRGB(255, 217, 0)
+    stroke.Parent = root
+
+-- ✅ Title diganti LOGO (rbxassetid)
+local logo = Instance.new("ImageLabel")
+logo.Name = "Logo"
+logo.BackgroundTransparency = 1
+logo.AnchorPoint = Vector2.new(0.5, 0)
+logo.Position = UDim2.new(0.5, 0, 0, 10)
+logo.Size = UDim2.fromOffset(52, 52)
+logo.Image = "rbxassetid://103570401113729"
+logo.ImageTransparency = 0.05
+logo.Parent = root
+
+-- optional glow tipis (lebih “NodeHub”)
+local lg = Instance.new("UIStroke")
+lg.Thickness = 1
+lg.Transparency = 0.35
+lg.Color = Color3.fromRGB(255, 217, 0)
+lg.Parent = logo
+
+
+
+    -- BAR (segmented kotak-kotak)
+    local shell = Instance.new("Frame")
+    shell.Name = "BarShell"
+    shell.AnchorPoint = Vector2.new(0.5, 0.5)
+    shell.Position = UDim2.new(0.5, 0, 0.74, 0)
+
+
+    shell.Size = UDim2.fromOffset(280, 36)
+    shell.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    shell.BackgroundTransparency = 0
+    shell.BorderSizePixel = 0
+    shell.Parent = root
+
+    local shellCorner = Instance.new("UICorner")
+    shellCorner.CornerRadius = UDim.new(0, 10)
+    shellCorner.Parent = shell
+
+    local shellStroke = Instance.new("UIStroke")
+    shellStroke.Thickness = 2
+    shellStroke.Transparency = 0.08
+    shellStroke.Color = Color3.fromRGB(255, 217, 0)
+    shellStroke.Parent = shell
+
+    local inner = Instance.new("Frame")
+    inner.Name = "Inner"
+    inner.Size = UDim2.new(1, -12, 1, -12)
+    inner.Position = UDim2.fromOffset(6, 6)
+    inner.BackgroundTransparency = 1
+    inner.Parent = shell
+
+    -- Segments container
+    local segments = Instance.new("Frame")
+    segments.Name = "Segments"
+    segments.Size = UDim2.new(1, 0, 1, 0)
+    segments.BackgroundTransparency = 1
+    segments.Parent = inner
+
+    local layout = Instance.new("UIListLayout")
+    layout.FillDirection = Enum.FillDirection.Horizontal
+    layout.HorizontalAlignment = Enum.HorizontalAlignment.Left
+    layout.VerticalAlignment = Enum.VerticalAlignment.Center
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 4)
+    layout.Parent = segments
+
+    local SEG_COUNT = 12
+    local segmentFrames = {}
+
+    for i = 1, SEG_COUNT do
+        local seg = Instance.new("Frame")
+        seg.Name = "Seg" .. i
+        seg.Size = UDim2.new(1/SEG_COUNT, -4, 1, 0)
+        seg.BackgroundColor3 = Color3.fromRGB(255, 217, 0)
+        seg.BackgroundTransparency = 0.85 -- default “mati”
+        seg.BorderSizePixel = 0
+        seg.Parent = segments
+
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 6)
+        c.Parent = seg
+
+        table.insert(segmentFrames, seg)
+    end
+
+    -- Text progress di tengah bar
+    local midText = Instance.new("TextLabel")
+    midText.Name = "MidText"
+    midText.BackgroundTransparency = 1
+    midText.AnchorPoint = Vector2.new(0.5, 0.5)
+    midText.Position = UDim2.new(0.5, 0, 0.5, 0)
+    midText.Size = UDim2.new(1, 0, 1, 0)
+    midText.Font = Enum.Font.GothamBold
+    midText.TextSize = 14
+    midText.TextColor3 = Color3.fromRGB(230, 230, 230)
+    midText.TextStrokeTransparency = 0.35
+    midText.Text = ("0/%d"):format(total)
+    midText.Parent = inner
+
+    -- Anim: stroke pulse halus
+    local strokeTw = TweenService:Create(
+        stroke,
+        TweenInfo.new(0.9, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+        { Transparency = 0.30 }
+    )
+    strokeTw:Play()
+
+    local alive = true
+    local currentLit = 0
+
+    -- efek “charging shimmer” jalan bolak-balik di seg yang sudah nyala
+    local shimmerIdx = 1
+    local shimmerDir = 1
+    local hbConn
+
+    local function applySegments(litCount)
+        litCount = math.clamp(litCount, 0, SEG_COUNT)
+
+        for i = 1, SEG_COUNT do
+            local seg = segmentFrames[i]
+            if i <= litCount then
+                seg.BackgroundTransparency = 0.15
+            else
+                seg.BackgroundTransparency = 0.85
+            end
+        end
+    end
+
+    hbConn = RunService.Heartbeat:Connect(function(dt)
+        if not alive then return end
+        if currentLit <= 0 then return end
+
+        shimmerIdx += shimmerDir
+        if shimmerIdx >= currentLit then
+            shimmerIdx = currentLit
+            shimmerDir = -1
+        elseif shimmerIdx <= 1 then
+            shimmerIdx = 1
+            shimmerDir = 1
+        end
+
+        -- reset baseline untuk yang nyala
+        for i = 1, currentLit do
+            segmentFrames[i].BackgroundTransparency = 0.15
+        end
+
+        -- shimmer: bikin 1 seg agak terang
+        local s = segmentFrames[shimmerIdx]
+        if s then s.BackgroundTransparency = 0.02 end
+    end)
+
+    local function setProgress(p, textOrCounter)
+        if not alive then return end
+
+        -- dukung mode “teks angka langsung”
+        if type(textOrCounter) == "string" and textOrCounter:find("/") then
+            midText.Text = textOrCounter
+        end
+
+        p = math.clamp(tonumber(p) or 0, 0, 1)
+
+        local lit = math.floor(p * SEG_COUNT + 0.00001)
+        if lit ~= currentLit then
+            currentLit = lit
+            applySegments(currentLit)
+        end
+    end
+
+    local function destroy()
+        if not alive then return end
+        alive = false
+        pcall(function() strokeTw:Cancel() end)
+        pcall(function() if hbConn then hbConn:Disconnect() end end)
+        pcall(function() gui:Destroy() end)
+    end
+
+    -- init
+    applySegments(0)
+    setProgress(0, ("0/%d"):format(total))
+
+    return {
+        SetProgress = setProgress,
+        Destroy = destroy,
+    }
+end
+
+--------------------------------------------------
+-- CONFIG MODULE URL
+--------------------------------------------------
+local MODULE_DEFS = {
+    {
+        key      = "MainUI",
+        name     = "MainUI",
+        url      = "https://gtwaapi.space/sc/auto_kg/NodeHubNeonUI.lua",
+        required = true,
+    },
+    {
+        key      = "AutoKgTabs",
+        name     = "AutoKG Tabs",
+        url      = "https://gtwaapi.space/sc/auto_kg/tabs_autokg.lua",
+        required = true,
+    },
+    {
+        key      = "MiscTabs",
+        name     = "Misc Tabs",
+        url      = "https://gtwaapi.space/sc/auto_kg/tabs_misc.lua",
+        required = true,
+    },
+    {
+        key      = "PetListView",
+        name     = "Module Pet List View",
+        url      = "https://gtwaapi.space/sc/auto_kg/pet_list_view.lua",
+        required = true,
+    },
+    {
+        key      = "WorldShardCleaner",
+        name     = "Module Shard Cleaner",
+        url      = "https://gtwaapi.space/sc/auto_kg/WorldShardCleaner.lua",
+        required = false,
+    },
+    {
+        key      = "Boost",
+        name     = "Module Boost",
+        url      = "https://gtwaapi.space/sc/auto_kg/module/boost.lua",
+        required = false,
+    },
+    {
+        key      = "Gift",
+        name     = "Module Gift",
+        url      = "https://gtwaapi.space/sc/auto_kg/module/gift.lua",
+        required = false,
+    },
+    {
+       key      = "AutoAccept",
+       name     = "Auto Accept Gift/Trade",
+       url      = "https://gtwaapi.space/sc/auto_kg/module/autoaccept.lua",
+       required = false, -- atau true kalau mau wajib
+    },
+    {
+       key      = "autokg_loop",
+       name     = "autokg_loop",
+       url      = "https://gtwaapi.space/sc/auto_kg/module/autokg_loop.lua",
+       required = false, -- atau true kalau mau wajib
+    },
+    {
+       key      = "autobuy",
+       name     = "autobuy",
+       url      = "https://gtwaapi.space/sc/auto_kg/module/autobuy.lua",
+       required = true, -- atau true kalau mau wajib
+    },
+    {
+       key      = "antiafk",
+       name     = "antiafk",
+       url      = "https://gtwaapi.space/sc/auto_kg/module/antiafk.lua",
+       required = false, -- atau true kalau mau wajib
+    },
+    {
+       key      = "PSReconnect",
+       name     = "PSReconnect",
+       url      = "https://gtwaapi.space/sc/auto_kg/module/PSReconnect.lua",
+       required = false, -- atau true kalau mau wajib
+    },
+    {
+       key      = "Feed",
+       name     = "Feed",
+       url      = "https://raw.githubusercontent.com/JordiTBA/oahgwgpaibdiugwa/refs/heads/main/feed",
+       required = false, -- atau true kalau mau wajib
+    },
+    {
+       key      = "swap_skill_module",
+       name     = "swap_skill_module",
+       url      = "https://gtwaapi.space/sc/auto_kg/module/swap_skill_module.lua",
+       required = true, -- atau true kalau mau wajib
+    },
+    {
+       key      = "Collectfruit",
+       name     = "collectfruit",
+       url      = "https://raw.githubusercontent.com/JordiTBA/oahgwgpaibdiugwa/refs/heads/main/Collectfruit.lua",
+       required = false, -- atau true kalau mau wajib
+    },
+
+    {
+       key      = "Termux",
+       name     = "termux",
+       url      = "https://raw.githubusercontent.com/JordiTBA/oahgwgpaibdiugwa/refs/heads/main/termux",
+       required = false, -- atau true kalau mau wajib
+    },
+
+
+
+
+}
+
+local STATE_URL = "https://gtwaapi.space/sc/auto_kg/state.lua"
+
+--------------------------------------------------
+-- UNIVERSAL HTTP REQUEST
+--------------------------------------------------
+local function httpRequest(url)
+    local req =
+        (syn and syn.request) or
+        (http and http.request) or
+        http_request or
+        (fluxus and fluxus.request) or
+        request
+
+    if req then
+        local res = req({
+            Url = url,
+            Method = "GET",
+        })
+        if not res then
+            error("no response")
+        end
+        return res.Body or res.body or ""
+    else
+        -- fallback Roblox default
+        return game:HttpGet(url)
+    end
+end
+
+--------------------------------------------------
+-- LOAD MODULES (PARALEL)
+--------------------------------------------------
+local Loaded    = {}
+local fatalErr  = false
+local finished  = 0
+local totalMods = #MODULE_DEFS
+local LOADER = CreateMiniLoader(totalMods)
+
+local function loadOneModule(def)
+    if fatalErr then return end
+
+    local okBody, bodyOrErr = pcall(httpRequest, def.url)
+    if not okBody then
+        warn(("[NodeHub] Gagal HTTP %s dari %s: %s"):format(def.name, def.url, tostring(bodyOrErr)))
+        if def.required then
+            fatalErr = true
+        end
+        return
+    end
+
+    local body = bodyOrErr
+    local okLS, chunkOrErr = pcall(loadstring, body)
+    if not okLS or type(chunkOrErr) ~= "function" then
+        warn(("[NodeHub] loadstring gagal untuk %s: %s"):format(def.name, tostring(chunkOrErr)))
+        if def.required then
+            fatalErr = true
+        end
+        return
+    end
+
+    local okRun, result = pcall(chunkOrErr)
+    if not okRun then
+        warn(("[NodeHub] Eksekusi module %s error: %s"):format(def.name, tostring(result)))
+        if def.required then
+            fatalErr = true
+        end
+        return
+    end
+
+    if type(result) ~= "table" then
+       -- warn(("[NodeHub] Module %s tidak return table (type=%s)"):format(def.name, typeof(result)))
+        if def.required then
+            fatalErr = true
+        end
+        return
+    end
+
+    Loaded[def.key] = result
+end
+
+-- spawn semua module paralel
+for _, def in ipairs(MODULE_DEFS) do
+    task.spawn(function()
+        loadOneModule(def)
+        finished += 1
+
+        -- update loader
+        if LOADER then
+            LOADER.SetProgress(finished / totalMods, ("Loading %d/%d"):format(finished, totalMods))
+
+        end
+    end)
+end
+
+
+-- tunggu semua selesai atau fatal error
+while not fatalErr and finished < totalMods do
+    task.wait()
+end
+
+if fatalErr then
+    if LOADER then
+        LOADER.SetProgress(finished / totalMods, "Fatal error: module required gagal.")
+        task.wait(1.2)
+        LOADER.Destroy()
+    end
+    warn("[NodeHub] Fatal error saat load module, hentikan main.lua")
+    return
+end
+
+
+--------------------------------------------------
+-- LOAD STATE MODULE (boleh tetap sync)
+--------------------------------------------------
+local StateModule
+local STATE
+
+do
+    local okBody, bodyOrErr = pcall(httpRequest, STATE_URL)
+    if not okBody then
+        warn("[NodeHub] Gagal HTTP state.lua, pakai STATE default. Error:", tostring(bodyOrErr))
+    else
+        local okLS, chunkOrErr = pcall(loadstring, bodyOrErr)
+        if not okLS or type(chunkOrErr) ~= "function" then
+            warn("[NodeHub] loadstring state.lua gagal:", tostring(chunkOrErr))
+        else
+            local okRun, mod = pcall(chunkOrErr)
+            if not okRun or type(mod) ~= "table" then
+                warn("[NodeHub] Eksekusi state.lua gagal / bukan table:", tostring(mod))
+            else
+                StateModule = mod
+                if type(mod.load) == "function" then
+                    local okLoad, result = pcall(mod.load, STATE)
+                    if okLoad and type(result) == "table" then
+                        STATE = result
+                    else
+                        if not okLoad then
+                            warn("[NodeHub] State.load() error:", tostring(result))
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- fallback STATE kalau state.lua tidak mengembalikan table
+if not STATE then
+    STATE = {
+        autoKgOn        = false,
+        onlyGBXP        = false,
+        skipFavorited   = true,
+        skipMutated     = false,
+        onlyAboveTarget = false,
+        autoHatchOn     = false,
+        autoBuySeeds    = false,
+    }
+end
+
+
+
+--------------------------------------------------
+-- AMBIL MODULE YANG DIBUTUHKAN
+--------------------------------------------------
+local MainUI      = Loaded.MainUI
+local AutoTabsMod = Loaded.AutoKgTabs
+local MiscTabsMod = Loaded.MiscTabs
+local PetListView = Loaded.PetListView
+local BoostMod    = Loaded.Boost
+local AutoBuyMod  = Loaded.autobuy
+local TermuxMod   = Loaded.termux
+
+
+
+
+if not MainUI then
+    warn("[NodeHub] MainUI tidak tersedia, abort.")
+    return
+end
+
+--------------------------------------------------
+-- BUAT UI UTAMA
+--------------------------------------------------
+--------------------------------------------------
+-- BUAT UI UTAMA
+--------------------------------------------------
+local ui = MainUI.new({
+    title = "| NODE HUB",
+})
+
+-- ✅ anti UI dobel (kalau main.lua kepanggil 2x)
+do
+    local G = (getgenv and getgenv()) or _G
+    pcall(function()
+        if G.__NODEHUB_UI then
+            -- kalau ui kamu punya Destroy()
+            if type(G.__NODEHUB_UI.Destroy) == "function" then
+                G.__NODEHUB_UI:Destroy()
+            end
+            -- kalau yang disimpan adalah Instance GUI
+            if typeof(G.__NODEHUB_UI) == "Instance" then
+                G.__NODEHUB_UI:Destroy()
+            end
+        end
+    end)
+    G.__NODEHUB_UI = ui
+end
+
+-- optional helper untuk save state
+if StateModule and type(StateModule.save) == "function" then
+    function ui:SaveState()
+        StateModule.save()
+    end
+end
+
+
+--------------------------------------------------
+-- REGISTER TAB
+--------------------------------------------------
+if AutoTabsMod and AutoTabsMod.Register then
+    AutoTabsMod.Register(ui, STATE, PetListView)
+else
+    warn("[NodeHub] AutoKgTabs.Register tidak ditemukan")
+end
+
+if MiscTabsMod and MiscTabsMod.Register then
+    MiscTabsMod.Register(ui, STATE, PetListView)
+else
+    warn("[NodeHub] MiscTabsMod.Register tidak ditemukan")
+end
+
+
+-- sync kondisi awal autoBoost dari STATE
+if BoostMod and BoostMod.syncFromState then
+    BoostMod.syncFromState(STATE)
+end
+
+do
+    local G = (getgenv and getgenv()) or _G
+    if PetListView and type(PetListView) == "table" then
+        G.PetListView = PetListView
+    end
+end
+
+do
+    local env = (getgenv and getgenv()) or _G
+
+    if AutoBuyMod and type(AutoBuyMod) == "table" then
+        -- SET KE DUA ENV SEKALIGUS
+        env.AutoBuyModule = AutoBuyMod
+        _G.AutoBuyModule  = AutoBuyMod
+
+      --  print("[NodeHub] AutoBuyModule set (getgenv):", env.AutoBuyModule)
+     --   print("[NodeHub] AutoBuyModule set (_G):", _G.AutoBuyModule)
+    else
+     --   warn("[NodeHub] AutoBuy module tidak ke-load. Loaded.autobuy =", AutoBuyMod)
+    end
+end
+
+local SwapSkill = Loaded.swap_skill_module
+
+do
+    local env = (getgenv and getgenv()) or _G
+
+    if type(SwapSkill) == "table" then
+        env.SwapSkillModule = SwapSkill
+        _G.SwapSkillModule  = SwapSkill
+        env.SwapSkill       = SwapSkill
+        _G.SwapSkill        = SwapSkill
+    else
+        warn("[NodeHub] swap_skill_module tidak ke-load / bukan table:", SwapSkill)
+    end
+end
+
+-- =========================
+-- AUTO START AUTO BUY (SIMPLE)
+-- =========================
+pcall(function()
+    local AB = (getgenv and getgenv() or _G).AutoBuyModule
+    if AB and type(AB.SyncFromGlobals) == "function" then
+        AB.SyncFromGlobals()
+    end
+
+    if AB and type(AB.Start) == "function" then
+        if (AUTO_BUY_SEED_ENABLED == true) or (AUTO_BUY_EGG_ENABLED == true) or (AUTO_BUY_GEAR_ENABLED == true) then
+            AB.Start()
+        end
+    end
+end)
+
+-- AUTO START KG (SIMPLE)
+task.defer(function()
+    if _G.__AUTOKG_AUTOSTART_DONE then return end
+    _G.__AUTOKG_AUTOSTART_DONE = true
+
+    if AUTO_START_KG_ON_REJOIN ~= true then return end
+    local loop = rawget(_G, "AutoKGLoop")
+    if not loop or type(loop.Start) ~= "function" then return end
+    if type(loop.IsRunning) == "function" then
+        local ok, v = pcall(loop.IsRunning)
+        if ok and v == true then return end
+    elseif loop.running == true then
+        return
+    end
+
+    pcall(function() loop.Start(tostring(_G.GBXP_STAGE_MODE)) end)
+end)
+
+task.defer(function()
+    local env = (getgenv and getgenv()) or _G
+    local Mod = env.SwapSkillModule or _G.SwapSkillModule or env.SwapSkill or _G.SwapSkill
+    local STATE = env.STATE or _G.STATE
+    if not STATE or not Mod then return end
+
+    local function hasAnyTrue(map)
+        if type(map) ~= "table" then return false end
+        for _, v in pairs(map) do if v == true then return true end end
+        return false
+    end
+
+    for i=1,5 do
+        local ss = STATE.swap_skill
+        local okOn = ss and ss.enabled == true
+        local okSel = ss and hasAnyTrue(ss.selected)
+
+        --warn("[SwapSkillBoot]", "try", i, "enabled=", okOn, "hasAny=", okSel)
+
+        if okOn and okSel then
+            if type(Mod.SetDebug)=="function" then Mod.SetDebug(true) end
+            if type(Mod.SyncFromState)=="function" then Mod.SyncFromState() end
+            if type(Mod.Start)=="function" then Mod.Start() end
+            return
+        end
+        task.wait(0.6)
+    end
+
+    pcall(function()
+        if type(Mod.Stop)=="function" then Mod.Stop("boot") end
+    end)
+end)
+
+
+--------------------------------------------------
+-- TAB AWAL
+--------------------------------------------------
+ui:SetActiveMainTab("autokg")
+
+if LOADER then
+    LOADER.SetProgress(1, "Ready.")
+    task.wait(0.15)
+    LOADER.Destroy()
+end

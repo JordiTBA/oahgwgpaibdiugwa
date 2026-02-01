@@ -1,0 +1,76 @@
+-- Anti-DC Simple+ (tanpa global)
+-- Tempatkan sebagai LocalScript di StarterPlayerScripts
+
+local Players   = game:GetService("Players")
+local VirtualUser = game:GetService("VirtualUser")
+local VIM       = game:GetService("VirtualInputManager")
+local Run       = game:GetService("RunService")
+local LP        = Players.LocalPlayer
+
+local function nudge()
+    -- 1) Klik kanan kecil (cara klasik & paling aman)
+    pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new(0, 0))
+    end)
+
+    -- 2) Tap tombol kanan sebentar (tidak gerak jauh)
+    pcall(function()
+        VIM:SendKeyEvent(true, Enum.KeyCode.Right, false, game)
+        task.wait(0.03)
+        VIM:SendKeyEvent(false, Enum.KeyCode.Right, false, game)
+    end)
+
+    -- 3) Goyang kamera sedikit lalu balik (nyaris tak terlihat)
+    local cam = workspace.CurrentCamera
+    if cam then
+        local cf = cam.CFrame
+        cam.CFrame = cf * CFrame.Angles(0, math.rad(0.1), 0)
+        task.wait(0.02)
+        cam.CFrame = cf
+    end
+end
+
+-- Jalur 1: bangunkan saat Roblox menandai idle
+LP.Idled:Connect(nudge)
+
+-- Jalur 2: heartbeat berkala (jangan tunggu 20 menit)
+task.spawn(function()
+    while true do
+        task.wait(600 + math.random(0, 20)) -- 60â€“80 detik acak
+        nudge()
+    end
+end)
+
+
+
+LP.Idled:Connect(function()
+    pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new(0, 0))
+    end)
+end)
+
+
+
+local function antiIdle()
+    -- klik kanan klasik
+    pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new(0, 0))
+    end)
+
+    -- goyang mouse dikit (nyaris nggak kelihatan)
+    pcall(function()
+        VIM:SendMouseMoveEvent(10, 10, 0, game)
+    end)
+end
+
+LP.Idled:Connect(antiIdle)
+
+task.spawn(function()
+    while true do
+        task.wait(600 + math.random(0, 20)) -- ~10 menit
+        antiIdle()
+    end
+end)

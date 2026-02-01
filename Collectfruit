@@ -1,0 +1,299 @@
+-- collectfruit.lua (NodeHub)
+-- âœ… Auto Collect Fruit (NO UI, NO KG CHECK, NO AUTO SELL)
+-- âœ… Collect only if holdables < 200
+-- âœ… Toggle via: AUTO_COLLECT_FRUIT_ENABLED / _G.AUTO_COLLECT_FRUIT_ENABLED
+-- âœ… API: SetEnabled / setEnabled / start / stop / syncFromState
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local LP       = Players.LocalPlayer
+local username = LP.Name
+
+local M = {}
+
+----------------------------------------------------------------
+-- ENV / GLOBALS
+----------------------------------------------------------------
+local G = (getgenv and getgenv()) or _G
+
+----------------------------------------------------------------
+-- CONFIG
+----------------------------------------------------------------
+local LOOP_TICK_SEC      = 3        -- seberapa sering scan farm
+local COLLECT_BURST_GAP  = 0.45        -- jeda setelah Collect()
+local PROMPT_MARK_SEC    = 1.0         -- reset attr "Collected" setelah ini
+
+local MAX_HOLDABLE       = 200         -- batas holdable backpack
+
+-- Toggle global (state.lua akan set ini)
+G.AUTO_COLLECT_FRUIT_ENABLED = (G.AUTO_COLLECT_FRUIT_ENABLED == true)
+AUTO_COLLECT_FRUIT_ENABLED   = (AUTO_COLLECT_FRUIT_ENABLED == true)
+
+----------------------------------------------------------------
+-- DEPENDENCIES
+----------------------------------------------------------------
+local CollectController = require(
+    ReplicatedStorage:WaitForChild("Modules"):WaitForChild("CollectController")
+)
+
+-- optional DataService (buat cek inventory lebih akurat)
+local DataService = nil
+pcall(function()
+    DataService = require(ReplicatedStorage.Modules:WaitForChild("DataService"))
+end)
+
+----------------------------------------------------------------
+-- INTERNAL STATE
+----------------------------------------------------------------
+local running = false
+
+----------------------------------------------------------------
+-- SAFE GETUPVALUE / GETFENV (executor compatibility)
+----------------------------------------------------------------
+local function _getUpvalue(fn, idx)
+    if type(getupvalue) == "function" then
+        local ok, v = pcall(getupvalue, fn, idx)
+        if ok then return v end
+    end
+    return nil
+end
+
+local function _getFenv(fn)
+    if type(getfenv) == "function" then
+        local ok, env = pcall(getfenv, fn)
+        if ok then return env end
+    end
+    return nil
+end
+
+-- table prompt queue yang dipakai CollectController
+local tblPromptQueue = nil
+do
+    local env = _getFenv(CollectController.Collect)
+    if type(env) == "table" and type(env.tbl_2_upvr) == "table" then
+        tblPromptQueue = env.tbl_2_upvr
+    else
+        local uv = _getUpvalue(CollectController.Collect, 2)
+        if type(uv) == "table" then
+            tblPromptQueue = uv
+        end
+    end
+end
+
+----------------------------------------------------------------
+-- FIND OWN FARM
+----------------------------------------------------------------
+local function getOwnFarm()
+    local farmsFolder = workspace:FindFirstChild("Farm")
+    if not farmsFolder then return nil end
+
+    for _, farm in ipairs(farmsFolder:GetChildren()) do
+        local ok, ownerValue = pcall(function()
+            return farm:FindFirstChild("Important")
+                and farm.Important:FindFirstChild("Data")
+                and farm.Important.Data:FindFirstChild("Owner")
+                and farm.Important.Data.Owner.Value
+        end)
+
+        if ok and ownerValue == username then
+            return farm
+        end
+    end
+
+    return nil
+end
+
+----------------------------------------------------------------
+-- HOLDABLE COUNT CHECK
+-- Tujuan: kalau holdable >= 200, jangan collect.
+-- Implementasi: coba dari DataService inventory dulu, fallback scan Tool di Backpack/Character.
+----------------------------------------------------------------
+local function _countHoldablesFromProfile(profile)
+    if type(profile) ~= "table" then return nil end
+    local inv = profile.InventoryData
+    if type(inv) ~= "table" then return nil end
+
+    -- Heuristik: beberapa game simpan holdable di inv.Data / inv.Items / inv.Inventory / inv.Holdables
+    local candidates = { inv.Holdables, inv.Data, inv.Items, inv.Inventory }
+    for _, t in ipairs(candidates) do
+        if type(t) == "table" then
+            local n = 0
+            for _, item in pairs(t) do
+                if type(item) == "table" then
+                    -- coba deteksi tipe holdable
+                    local it = tostring(item.Type or item.ItemType or item.Category or ""):lower()
+                    if it:find("hold") or it:find("fruit") then
+                        n += 1
+                    else
+                        -- kalau tidak ada tipe, tetap hitung sebagai unit item (lebih aman untuk limit)
+                        n += 1
+                    end
+                else
+                    -- kadang isinya cuma id/uuid string
+                    n += 1
+                end
+            end
+            return n
+        end
+    end
+
+    return nil
+end
+
+local function _countHoldablesByTools()
+    local n = 0
+
+    local function scan(container)
+        if not container then return end
+        for _, inst in ipairs(container:GetChildren()) do
+            if inst:IsA("Tool") then
+                -- heuristik: buah/holdable biasanya Tool biasa.
+                -- kalau kamu punya pattern lebih spesifik, nanti bisa dipersempit.
+                n += 1
+            end
+        end
+    end
+
+    scan(LP:FindFirstChild("Backpack"))
+    local char = LP.Character
+    if char then scan(char) end
+
+    return n
+end
+
+local function getHoldableCount()
+    if DataService and type(DataService.GetData) == "function" then
+        local ok, profile = pcall(function()
+            return DataService:GetData()
+        end)
+        if ok and type(profile) == "table" then
+            local c = _countHoldablesFromProfile(profile)
+            if type(c) == "number" then
+                return c
+            end
+        end
+    end
+
+    -- fallback (kurang presisi tapi aman)
+    return _countHoldablesByTools()
+end
+
+----------------------------------------------------------------
+-- QUEUE FRUIT PROMPTS (NO KG CHECK)
+----------------------------------------------------------------
+local function queueFruitPrompts()
+    if type(tblPromptQueue) ~= "table" then
+        return 0
+    end
+
+    local farm = getOwnFarm()
+    if not farm then return 0 end
+
+    local important = farm:FindFirstChild("Important")
+    if not important then return 0 end
+
+    local plants = important:FindFirstChild("Plants_Physical")
+    if not plants then return 0 end
+
+    local count = 0
+
+    for _, plant in ipairs(plants:GetChildren()) do
+        local fruits = plant:FindFirstChild("Fruits")
+        if fruits then
+            for _, fruit in ipairs(fruits:GetChildren()) do
+                local prompt = fruit:FindFirstChildWhichIsA("ProximityPrompt", true)
+                if prompt and prompt.Enabled and not prompt:GetAttribute("Collected") then
+                    tblPromptQueue[prompt] = true
+                    prompt:SetAttribute("Collected", true)
+                    count += 1
+
+                    task.delay(PROMPT_MARK_SEC, function()
+                        if prompt and prompt:IsDescendantOf(workspace) then
+                            prompt:SetAttribute("Collected", nil)
+                        end
+                    end)
+                end
+            end
+        end
+    end
+
+    return count
+end
+
+----------------------------------------------------------------
+-- LOOP
+----------------------------------------------------------------
+local function collectLoop()
+    while running do
+        if G.AUTO_COLLECT_FRUIT_ENABLED == true then
+            -- âœ… cek kapasitas holdable dulu
+            local holdCount = getHoldableCount()
+            if holdCount < MAX_HOLDABLE then
+                local queued = queueFruitPrompts()
+                if queued > 0 then
+                    pcall(function()
+                        CollectController:Collect()
+                    end)
+                    task.wait(COLLECT_BURST_GAP)
+                end
+            else
+                -- penuh / mendekati penuh: skip collect
+                -- (kalau mau, bisa kasih log debug di sini)
+            end
+        end
+
+        task.wait(LOOP_TICK_SEC)
+    end
+end
+
+----------------------------------------------------------------
+-- PUBLIC API
+----------------------------------------------------------------
+function M.SetEnabled(on)
+    on = (on == true)
+    G.AUTO_COLLECT_FRUIT_ENABLED = on
+    AUTO_COLLECT_FRUIT_ENABLED   = on
+
+    if on then
+        if not running then
+            running = true
+            task.spawn(collectLoop)
+        end
+    else
+        running = false
+    end
+end
+
+function M.setEnabled(on) return M.SetEnabled(on) end
+function M.start() M.SetEnabled(true) end
+function M.stop(reason) M.SetEnabled(false) end
+
+function M.IsRunning()
+    return running == true and (G.AUTO_COLLECT_FRUIT_ENABLED == true)
+end
+
+function M.syncFromState()
+    local on = (AUTO_COLLECT_FRUIT_ENABLED == true) or (G.AUTO_COLLECT_FRUIT_ENABLED == true)
+    M.SetEnabled(on)
+end
+
+-- optional: allow override max holdable
+function M.SetMaxHoldable(n)
+    n = tonumber(n)
+    if n and n > 0 then
+        MAX_HOLDABLE = math.floor(n + 0.5)
+    end
+end
+
+_G.AutoCollectFruit = M
+G.AutoCollectFruit  = M
+
+-- auto apply kalau state sudah ON
+task.defer(function()
+    if (G.AUTO_COLLECT_FRUIT_ENABLED == true) then
+        M.SetEnabled(true)
+    end
+end)
+
+return M

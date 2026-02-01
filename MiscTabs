@@ -1,0 +1,901 @@
+-- tabs_misc.lua
+-- Main tab "Misc" â†’ sub tab:
+--   gift (3 baris konfigurasi auto gift)
+
+local M = {}
+
+
+
+function M.Register(ui, STATE, PetListView)
+    PetListView = PetListView or {
+        buildEntriesForTab = function()
+            return {}
+        end,
+    }
+
+    --------------------------------------------------
+    -- BIND STATE.GIFT_CFG â†’ ikut di-save ke file
+    --------------------------------------------------
+    STATE.GIFT_CFG = STATE.GIFT_CFG or GIFT_CFG
+    local giftCfg = STATE.GIFT_CFG
+
+    ----------------------------------------------------------------
+    -- helper autosave: pakai ui:SaveState() dari main.lua
+    ----------------------------------------------------------------
+    local function autoSave()
+        if ui and type(ui.SaveState) == "function" then
+            task.defer(function()
+                local ok, err = pcall(function()
+                    ui:SaveState()
+                end)
+                if not ok then
+                    warn("[Misc/Gift] Gagal ui:SaveState():", err)
+                end
+            end)
+        else
+            warn("[Misc/Gift] ui.SaveState() tidak tersedia, perubahan TIDAK di-persist.")
+        end
+    end
+    
+    
+   local Players = game:GetService("Players")
+   local LocalPlayer = Players.LocalPlayer
+
+    --------------------------------------------------
+    -- DATA SOURCE: TARGET DROPDOWN (PAKAI PLAYERS)
+    --------------------------------------------------
+local function getTargetItems()
+    local items = {}
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer then
+            table.insert(items, {
+                key      = plr.Name,     -- dipakai dropdown
+                name     = plr.Name,     -- tampil di UI
+                userId   = plr.UserId,   -- disimpan ke config
+            })
+        end
+    end
+
+    return items
+end
+
+
+    --------------------------------------------------
+    -- MAIN TAB: Misc
+    --------------------------------------------------
+    ui:RegisterMainTab("misc", "Misc", 2)
+    if ui.SetFooterButtonsFor then
+        -- kosongkan footer â†’ footer hidden, content melebar
+        ui:SetFooterButtonsFor("misc", {})
+    end
+
+ui:RegisterSubTab("misc", "buy", "Auto Buy", function()
+    ui:ClearSubContent()
+
+    local sectionSetters = {}
+    local function createSection(title, defaultOpen)
+        local body, setExpanded = ui:CreateSection(title, defaultOpen or false)
+        table.insert(sectionSetters, setExpanded)
+        return body
+    end
+
+    local body1 = createSection(" Auto Buy Seed", false)
+    local body2 = createSection(" Auto Buy Egg",  false)
+    local body3 = createSection(" Auto Buy Gear", false)
+
+    local function cleanSelectedMap(selectedMap)
+        local out = {}
+        for k, v in pairs(selectedMap or {}) do
+            if v == true then out[tostring(k)] = true end
+        end
+        return out
+    end
+
+    local function getAutoBuy()
+        local env = (getgenv and getgenv()) or _G
+        return env.AutoBuyModule or _G.AutoBuyModule
+    end
+
+    -- âœ… normalize list: support {"A","B"} atau {{key="A",name="A"},...}
+    local function normalizeDropdownItems(list)
+        local out = {}
+        if type(list) ~= "table" then return out end
+
+        for _, it in ipairs(list) do
+            if type(it) == "string" then
+                out[#out+1] = { key = it, name = it }
+            elseif type(it) == "table" then
+                local k = it.key or it.name or it.id
+                local n = it.name or it.key or it.id
+                if k and n then
+                    out[#out+1] = { key = tostring(k), name = tostring(n) }
+                end
+            end
+        end
+        return out
+    end
+
+    -- âœ… PREFETCH LIST SEKALI
+    local AutoBuy = getAutoBuy()
+    if not AutoBuy or (type(AutoBuy.GetLists) ~= "function" and type(AutoBuy.GetShopInfo) ~= "function") then
+        warn("[AutoBuy UI] AutoBuyModule belum siap / GetLists() tidak ada")
+        ui:CreateRowLabel(body1, "âš  AutoBuyModule belum siap. Reopen tab.")
+        return
+    end
+
+    local SeedItems, EggItems, GearItems = {}, {}, {}
+    do
+        local ok, a, b, c = pcall(function()
+            if type(AutoBuy.GetLists) == "function" then
+                return AutoBuy.GetLists()          -- function style
+            else
+                return {}, {}, {}
+            end
+        end)
+
+        if ok then
+            SeedItems = normalizeDropdownItems(a or {})
+            EggItems  = normalizeDropdownItems(b or {})
+            GearItems = normalizeDropdownItems(c or {})
+        end
+
+       -- print("[AutoBuy UI] lists:", "seed", #SeedItems, "egg", #EggItems, "gear", #GearItems)
+        --if SeedItems[1] then print("[AutoBuy UI] seed sample:", SeedItems[1].key, SeedItems[1].name) end
+    end
+
+local function syncAutoBuy()
+    if AutoBuy and type(AutoBuy.SyncFromGlobals) == "function" then
+        pcall(AutoBuy.SyncFromGlobals)
+    end
+
+    -- âœ… auto start/stop loop berdasarkan toggle
+    local anyOn = (AUTO_BUY_SEED_ENABLED == true) or (AUTO_BUY_EGG_ENABLED == true) or (AUTO_BUY_GEAR_ENABLED == true)
+    if AutoBuy and type(AutoBuy.Start) == "function" and type(AutoBuy.Stop) == "function" then
+        if anyOn then
+            AutoBuy.Start()
+        else
+            AutoBuy.Stop()
+        end
+    end
+end
+
+
+    -- =========================
+    -- AUTO BUY SEED
+    -- =========================
+    SEED_SELECTED = cleanSelectedMap(SEED_SELECTED or {})
+    AUTO_BUY_SEED_ENABLED = (AUTO_BUY_SEED_ENABLED == true)
+
+    ui:CreateRowDropdown(body1, {
+        label       = "Select Seed",
+        placeholder = "Select Seed...",
+        mode        = "multi",
+        getItems    = function() return SeedItems end,
+        initial     = SEED_SELECTED,
+        onChanged   = function(_, selectedMap)
+            SEED_SELECTED = cleanSelectedMap(selectedMap)
+            syncAutoBuy()
+            autoSave()
+        end,
+    })
+
+    ui:CreateRowToggle(body1, "Auto Buy Seed", AUTO_BUY_SEED_ENABLED, function(isOn)
+        AUTO_BUY_SEED_ENABLED = (isOn == true)
+        syncAutoBuy()
+        autoSave()
+    end)
+
+    -- =========================
+    -- AUTO BUY EGG
+    -- =========================
+    EGG_SELECTED = cleanSelectedMap(EGG_SELECTED or {})
+    AUTO_BUY_EGG_ENABLED = (AUTO_BUY_EGG_ENABLED == true)
+
+    ui:CreateRowDropdown(body2, {
+        label       = "Select Egg",
+        placeholder = "Select Egg...",
+        mode        = "multi",
+        getItems    = function() return EggItems end,
+        initial     = EGG_SELECTED,
+        onChanged   = function(_, selectedMap)
+            EGG_SELECTED = cleanSelectedMap(selectedMap)
+            syncAutoBuy()
+            autoSave()
+        end,
+    })
+
+    ui:CreateRowToggle(body2, "Auto Buy Egg", AUTO_BUY_EGG_ENABLED, function(isOn)
+        AUTO_BUY_EGG_ENABLED = (isOn == true)
+        syncAutoBuy()
+        autoSave()
+    end)
+
+    -- =========================
+    -- AUTO BUY GEAR
+    -- =========================
+    GEAR_SELECTED = cleanSelectedMap(GEAR_SELECTED or {})
+    AUTO_BUY_GEAR_ENABLED = (AUTO_BUY_GEAR_ENABLED == true)
+
+    ui:CreateRowDropdown(body3, {
+        label       = "Select Gear",
+        placeholder = "Select Gear...",
+        mode        = "multi",
+        getItems    = function() return GearItems end,
+        initial     = GEAR_SELECTED,
+        onChanged   = function(_, selectedMap)
+            GEAR_SELECTED = cleanSelectedMap(selectedMap)
+            syncAutoBuy()
+            autoSave()
+        end,
+    })
+
+    ui:CreateRowToggle(body3, "Auto Buy Gear", AUTO_BUY_GEAR_ENABLED, function(isOn)
+        AUTO_BUY_GEAR_ENABLED = (isOn == true)
+        syncAutoBuy()
+        autoSave()
+    end)
+
+    syncAutoBuy()
+
+    if #sectionSetters >= 1 then
+        sectionSetters[1](true)
+        for i = 2, #sectionSetters do sectionSetters[i](false) end
+    end
+end, 1)
+
+
+
+
+
+
+
+    --------------------------------------------------
+    -- Helper: bangun satu section Gift (row 1 / 2 / 3)
+    --------------------------------------------------
+    local function buildGiftSection(body, suffix, title, PetItems)
+        suffix = suffix or ""  -- "", "B", "C"
+
+        local keyEnabled = "enabled" .. suffix
+        local keyTargets = "targets" .. suffix
+        local keyMinKG   = "minKG"   .. suffix
+        local keyMinAge  = "minAge"  .. suffix
+        local keyPetType = "petType" .. suffix
+        local keyMut     = "mut"     .. suffix   -- ðŸ”¹ BARU: filter mutasi per Gift
+        -- default
+        giftCfg[keyEnabled] = giftCfg[keyEnabled] or false
+        giftCfg[keyTargets] = giftCfg[keyTargets] or {}
+        giftCfg[keyMinKG]   = giftCfg[keyMinKG]   or 0
+        giftCfg[keyMinAge]  = giftCfg[keyMinAge]  or 0
+        giftCfg[keyPetType] = giftCfg[keyPetType] or {}
+        giftCfg[keyMut]       = giftCfg[keyMut]       or {}   -- map: mutName -> true
+
+
+        ------------------------------------------------------
+        -- DROPDOWN: Target  (pakai Players:GetPlayers())
+        ------------------------------------------------------
+        ui:CreateRowDropdown(body, {
+            label       = "Target",
+            placeholder = "Pilih target gift...",
+            mode        = "multi",
+
+            getItems = function()
+                return getTargetItems()
+            end,
+
+            -- initial: konversi dari GIFT_CFG.targets/targetsB/targetsC
+            -- bisa format struct lama ({userId=, name=}) atau map bool
+initial = (function()
+    local map = {}
+    local src = giftCfg[keyTargets]
+
+    if type(src) == "table" then
+        for k, v in pairs(src) do
+            if type(v) == "table" and v.name then
+                map[v.name] = true
+            elseif v == true then
+                map[tostring(k)] = true
+            end
+        end
+    end
+    return map
+end)(),
+
+
+onChanged = function(mode, selectedMap)
+    giftCfg[keyTargets] = {}
+
+    if type(selectedMap) == "table" then
+        for name, enabled in pairs(selectedMap) do
+            if enabled then
+                -- Cari player ID agar tetap bisa disimpan
+                local plr = Players:FindFirstChild(name)
+                local uid = plr and plr.UserId or nil
+
+                giftCfg[keyTargets][name] = {
+                    userId = uid,
+                    name   = name,
+                }
+            end
+        end
+    end
+
+    autoSave()
+end,
+
+        })
+
+    
+                ------------------------------------------------------
+        -- DROPDOWN: Pet Type  (pakai PetItems dari PetListView)
+        ------------------------------------------------------
+        ui:CreateRowDropdown(body, {
+            label       = "Select Pet Type",
+            placeholder = "Select Pet...",
+            mode        = "multi",
+
+            getItems = function()
+                return PetItems   -- sama seperti di autokg.lua
+            end,
+
+            -- map: { ["Dragon"] = true, ["Elephant"] = true, ... }
+            initial = giftCfg[keyPetType] or {},
+
+            onChanged = function(mode, selectedMap)
+                giftCfg[keyPetType] = {}
+
+                if type(selectedMap) == "table" then
+                    for petName, enabled in pairs(selectedMap) do
+                        if enabled then
+                            giftCfg[keyPetType][petName] = true   -- simpan HANYA key (nama)
+                        end
+                    end
+                end
+
+                autoSave()
+            end,
+        })
+    
+------------------------------------------------------
+-- ðŸ”¹ KEY KHUSUS: "No Mutation"
+------------------------------------------------------
+local NO_MUTATION_KEY = "__NO_MUTATION__"
+local NO_MUTATION_LABEL = "[TANPA MUTASI]"
+
+------------------------------------------------------
+-- ðŸ”¹ DROPDOWN: Mutation Filter (per Gift)
+--    - isi dari PetListView.listAllMutations()
+--    - plus 1 item khusus: [TANPA MUTASI]
+--    - simpan map: { ["Giant"] = true, ["Mini"] = true, [NO_MUTATION_KEY] = true, ... }
+------------------------------------------------------
+ui:CreateRowDropdown(body, {
+    label       = "Mutation Filter",
+    placeholder = "(Optional) Pilih mutasi...",
+    mode        = "multi",
+
+    getItems = function()
+        local items = {}
+
+        -- 1) Tambah entry khusus "tanpa mutasi"
+        table.insert(items, {
+            key  = NO_MUTATION_KEY,
+            name = NO_MUTATION_LABEL,
+        })
+
+        -- 2) Mutasi biasa dari PetListView
+        local PLV = PetListView  -- asumsi sudah ada di scope luar
+        if PLV and type(PLV.listAllMutations) == "function" then
+            local muts = PLV.listAllMutations()
+            for _, mutName in ipairs(muts) do
+                table.insert(items, {
+                    key  = mutName,
+                    name = mutName,
+                })
+            end
+        end
+
+        return items
+    end,
+
+    -- langsung map yang disimpan di config
+    initial = giftCfg[keyMut] or {},
+
+    onChanged = function(mode, selectedMap)
+        local map = {}
+
+        if type(selectedMap) == "table" then
+            for mutName, enabled in pairs(selectedMap) do
+                if enabled then
+                    map[mutName] = true
+                end
+            end
+        end
+
+        -- simpan ke config (termasuk NO_MUTATION_KEY kalau dipilih)
+        giftCfg[keyMut] = map
+        autoSave()
+    end,
+})
+
+        ------------------------------------------------------
+        -- INPUT: Min Age  (boleh minus)
+        ------------------------------------------------------
+        ui:CreateRowInput(
+            body,
+            "Age",
+            tostring(giftCfg[keyMinAge] or 0),
+            function(text)
+                text = tostring(text or ""):gsub("%s+", "")
+
+                -- âœ… izinkan user ngetik "-" dulu (belum angka)
+                if text == "" or text == "-" then
+                    return
+                end
+
+                local num = tonumber(text)
+                if num == nil then
+                    return
+                end
+
+                -- kalau kamu tetap mau clamp: (opsional)
+                -- if num < 0 then num = 0 end
+
+                giftCfg[keyMinAge] = num
+                autoSave()
+            end
+        )
+
+        ------------------------------------------------------
+        -- INPUT: Min KG (Assumed at age 100)  (boleh minus)
+        ------------------------------------------------------
+        ui:CreateRowInput(
+            body,
+            "KG ( Assumed at age 100 )",
+            tostring(giftCfg[keyMinKG] or 0),
+            function(text)
+                text = tostring(text or ""):gsub("%s+", "")
+
+                -- âœ… izinkan "-" dulu
+                if text == "" or text == "-" then
+                    return
+                end
+
+                local num = tonumber(text)
+                if num == nil then
+                    return
+                end
+
+                -- kalau kamu tetap mau clamp: (opsional)
+                -- if num < 0 then num = 0 end
+
+                giftCfg[keyMinKG] = num
+                autoSave()
+            end
+        )
+
+
+
+
+
+    
+    
+    
+                ------------------------------------------------------
+        -- TOGGLE: Gift X Enabled
+        ------------------------------------------------------
+        ui:CreateRowToggle(
+            body,
+            title .. " Enabled",
+            giftCfg[keyEnabled] == true,
+            function(isOn)
+                giftCfg[keyEnabled] = isOn and true or false
+                autoSave()
+            end
+        )
+    end
+    
+
+
+    --------------------------------------------------
+    -- SUBTAB: misc > gift
+    --------------------------------------------------
+    ui:RegisterSubTab("misc", "gift", "Auto Gift", function()
+        ui:ClearSubContent()
+
+        -- ðŸ”¹ ambil PetItems DI SINI, sama persis seperti di autokg.lua
+        local PetItems = {}
+        if PetListView and PetListView.buildPetItems then
+            PetItems = PetListView.buildPetItems()
+        end
+
+        -- debug dikit kalau mau cek
+        -- print("[Misc/Gift] PetItems count =", #PetItems)
+
+        -- list setter section buat open/close
+        local sectionSetters = {}
+
+        local function createSection(title, defaultOpen)
+            local body, setExpanded = ui:CreateSection(title, defaultOpen or false)
+            table.insert(sectionSetters, setExpanded)
+            return body
+        end
+
+        -- 3 Section Gift
+        local body1 = createSection("Gift 1", false)   -- default kebuka
+        local body2 = createSection("Gift 2", false)
+        local body3 = createSection("Gift 3", false)
+        local body4 = createSection("Auto Accept Gift / Trade", false)
+
+        -- isi tiap section (PetItems dikirim ke masing2)
+        buildGiftSection(body1,  "",  "Gift 1", PetItems)
+        buildGiftSection(body2,  "B", "Gift 2", PetItems)
+        buildGiftSection(body3,  "C", "Gift 3", PetItems)
+
+
+    
+        ------------------------------------------------------
+        -- TOGGLE: Auto Accept Trade
+        ------------------------------------------------------
+        giftCfg.autoAcceptTrade = giftCfg.autoAcceptTrade or false
+
+        ui:CreateRowToggle(
+            body4,
+            "Auto Accept Trade",
+            giftCfg.autoAcceptTrade == true,
+            function(isOn)
+                giftCfg.autoAcceptTrade = isOn and true or false
+                autoSave()
+            end
+        )
+
+        ------------------------------------------------------
+        -- TOGGLE: Auto Accept Gift
+        ------------------------------------------------------
+        giftCfg.autoAcceptGift = giftCfg.autoAcceptGift or false
+
+        ui:CreateRowToggle(
+            body4,
+            "Auto Accept Gift",
+            giftCfg.autoAcceptGift == true,
+            function(isOn)
+                giftCfg.autoAcceptGift = isOn and true or false
+                autoSave()
+            end
+        )
+        -- aturan expand: default cuma Gift 1 yang kebuka
+        if #sectionSetters >= 1 then
+            sectionSetters[1](false)
+            for i = 2, #sectionSetters do
+                sectionSetters[i](false)
+            end
+        end
+    end, 2)
+    
+    
+ui:RegisterSubTab("misc", "webhook", "Webhook", function()
+    ui:ClearSubContent()
+
+    local sectionSetters = {}
+    local function createSection(title, defaultOpen)
+        local body, setExpanded = ui:CreateSection(title, defaultOpen or false)
+        table.insert(sectionSetters, setExpanded)
+        return body
+    end
+
+    local body1 = createSection("( Few Day )", true)
+
+
+    if #sectionSetters >= 1 then
+        sectionSetters[1](true)
+        for i = 2, #sectionSetters do
+            sectionSetters[i](false)
+        end
+    end
+end, 3)
+
+
+ui:RegisterSubTab("misc", "rejoin", "Rejoin", function()
+    ui:ClearSubContent()
+
+    local sectionSetters = {}
+    local function createSection(title, defaultOpen)
+        local body, setExpanded = ui:CreateSection(title, defaultOpen or false)
+        table.insert(sectionSetters, setExpanded)
+        return body
+    end
+
+    local body1 = createSection("Auto Reconnect / Start", true)
+
+    local function syncReconnectModule()
+        pcall(function()
+            if _G.PSReconnect and type(_G.PSReconnect.SetEnabled) == "function" then
+                _G.PSReconnect:SetEnabled(AUTO_RECONNECT_ENABLED == true)
+            end
+            local ak = (AUTO_START_KG_ON_REJOIN == true)
+if type(_G.PSReconnect.SetAutoStartKG) == "function" then
+    _G.PSReconnect:SetAutoStartKG(ak)
+elseif type(_G.PSReconnect.setAutoStartKG) == "function" then
+    _G.PSReconnect:setAutoStartKG(ak)
+end
+
+        end)
+    end
+
+    -- Toggle: Auto Exec (save saja; PSReconnect baca dari file saat join/teleport)
+    ui:CreateRowToggle(body1, "Auto Exec", AUTO_START_ON_REJOIN == true, function(on)
+        AUTO_START_ON_REJOIN = (on == true)
+        autoSave()
+        -- tidak perlu sync modul
+    end)
+
+    -- Toggle: Auto Reconnect (langsung sync modul)
+    ui:CreateRowToggle(body1, "Auto Reconnect", AUTO_RECONNECT_ENABLED == true, function(on)
+        AUTO_RECONNECT_ENABLED = (on == true)
+        syncReconnectModule()
+        autoSave()
+    end)
+
+    -- Toggle: Auto Start KG (nanti disambung; sekarang save saja)
+    ui:CreateRowToggle(body1, "Auto Start KG", AUTO_START_KG_ON_REJOIN == true, function(on)
+        AUTO_START_KG_ON_REJOIN = (on == true)
+        autoSave()
+    end)
+
+    -- Momentary toggle: Rejoin Now (tidak disave)
+    ui:CreateRowToggle(body1, "Rejoin Now", false, function(on)
+        if on ~= true then return end
+
+        local done = false
+        pcall(function()
+            if _G.PSReconnect then
+                if type(_G.PSReconnect.RejoinNow) == "function" then
+                    _G.PSReconnect:RejoinNow()
+                    done = true
+                elseif type(_G.PSReconnect.rejoinNow) == "function" then
+                    _G.PSReconnect:rejoinNow()
+                    done = true
+                end
+            end
+        end)
+
+        if not done then
+            pcall(function()
+                local TeleportService = game:GetService("TeleportService")
+                local Players = game:GetService("Players")
+                TeleportService:Teleport(game.PlaceId, Players.LocalPlayer)
+            end)
+        end
+
+        -- optional reset OFF (kalau UI punya helper)
+        task.defer(function()
+            if ui.SetToggleValue then
+                ui:SetToggleValue("Rejoin Now", false)
+            end
+        end)
+    end)
+    
+        ----------------------------------------------------------------
+    -- SECTION 2: Auto Open Roblox (Termux)
+    ----------------------------------------------------------------
+    AUTO_OPEN_RBLX_ENABLED   = (AUTO_OPEN_RBLX_ENABLED == true)
+    AUTO_OPEN_RBLX_MODE      = AUTO_OPEN_RBLX_MODE or "mode1" -- "mode1" / "mode2"
+    AUTO_OPEN_RBLX_LINK      = AUTO_OPEN_RBLX_LINK or ""
+    AUTO_OPEN_RBLX_OPEN_MIN  = tonumber(AUTO_OPEN_RBLX_OPEN_MIN)  or 30
+    AUTO_OPEN_RBLX_CLOSE_MIN = tonumber(AUTO_OPEN_RBLX_CLOSE_MIN) or 1
+
+    local body2 = createSection("Auto Open Roblox (Termux)", false)
+
+    -- Toggle utama ON/OFF
+    ui:CreateRowToggle(body2, "Enable Auto Open Roblox", AUTO_OPEN_RBLX_ENABLED, function(on)
+        AUTO_OPEN_RBLX_ENABLED = (on == true)
+        autoSave()
+    end)
+
+    ----------------------------------------------------------------
+    -- DROPDOWN MODE (SINGLE) â€“ pakai key/name
+    ----------------------------------------------------------------
+    local MODE_ITEMS = {
+        {
+            key  = "mode1",
+            name = "Mode 1 â€“ Watchdog FC Crash",
+        },
+        {
+            key  = "mode2",
+            name = "Mode 2 â€“ Loop Cycle (open/close)",
+        },
+    }
+
+    -- pastikan nilai awal valid
+    if AUTO_OPEN_RBLX_MODE ~= "mode1" and AUTO_OPEN_RBLX_MODE ~= "mode2" then
+        AUTO_OPEN_RBLX_MODE = "mode1"
+    end
+
+    ui:CreateRowDropdown(body2, {
+        label       = "Mode Auto Open Roblox",
+        placeholder = "Pilih Mode...",
+        mode        = "single",
+        getItems    = function()
+            return MODE_ITEMS
+        end,
+        -- SINGLE MODE: initial = key (string), bukan map
+        initial     = AUTO_OPEN_RBLX_MODE,
+        onChanged   = function(mode, selectedKey)
+            -- mode == "single"
+            AUTO_OPEN_RBLX_MODE = selectedKey or "mode1"
+            autoSave()
+        end,
+    })
+
+    ----------------------------------------------------------------
+    -- Input: Link + Delay (menit)
+    ----------------------------------------------------------------
+    ui:CreateRowInput(
+        body2,
+        "Link Private Server",
+        AUTO_OPEN_RBLX_LINK or "",
+        function(text)
+            AUTO_OPEN_RBLX_LINK = tostring(text or "")
+            autoSave()
+        end,
+        false -- clearOnFocus = false
+    )
+
+    ui:CreateRowInput(body2, "Delay After Open Roblox (Minute)", tostring(AUTO_OPEN_RBLX_OPEN_MIN), function(text)
+        local n = tonumber(text)
+        if not n or n < 0 then n = 1 end
+        AUTO_OPEN_RBLX_OPEN_MIN = n
+        autoSave()
+    end)
+
+    ui:CreateRowInput(body2, "Delay After BACK HOME (Minute)", tostring(AUTO_OPEN_RBLX_CLOSE_MIN), function(text)
+        local n = tonumber(text)
+        if not n or n < 0 then n = 1 end
+        AUTO_OPEN_RBLX_CLOSE_MIN = n
+        autoSave()
+    end)
+
+----------------------------------------------------------------
+-- SECTION 3: Copy Command Termux (Custom UI, simple)
+----------------------------------------------------------------
+local body3 = createSection("Copy Command Termux", false)
+
+local COMMANDS = {
+    {
+        title = "Copy perintah (Delta Workspace) lalu paste di Termux:",
+        cmd   = "bash /storage/emulated/0/Delta/Workspace/workspace/roblox_ps_cycle.sh",
+    },
+    {
+        title = "Copy perintah (Roblox Workspace) lalu paste di Termux:",
+        cmd   = "bash /storage/emulated/0/Android/data/com.roblox.client/files/gloop/external/Workspace/workspace/roblox_ps_cycle.sh",
+    },
+}
+
+local function createTermuxCommandRow(parent, titleText, cmdText)
+    -- container 1 row
+    local row = Instance.new("Frame")
+    row.Name = "TermuxCommandRow"
+    row.BackgroundTransparency = 1
+    row.Size = UDim2.new(1, 0, 0, 60)
+    row.Parent = parent
+
+    -- layout vertikal dalam row (judul + box)
+    local vLayout = Instance.new("UIListLayout")
+    vLayout.Parent = row
+    vLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    vLayout.FillDirection = Enum.FillDirection.Vertical
+    vLayout.Padding = UDim.new(0, 4)
+
+    -- judul kecil
+    local title = Instance.new("TextLabel")
+    title.Name = "Label"
+    title.Parent = row
+    title.BackgroundTransparency = 1
+    title.Size = UDim2.new(1, 0, 0, 18)
+    title.Font = Enum.Font.Gotham
+    title.TextSize = 13
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.TextYAlignment = Enum.TextYAlignment.Center
+    title.Text = titleText
+    title.TextColor3 = Color3.fromRGB(230, 230, 230)
+
+    -- box command
+    local box = Instance.new("Frame")
+    box.Name = "CommandBox"
+    box.Parent = row
+    box.Size = UDim2.new(1, 0, 0, 30)
+    box.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = box
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Thickness = 1
+    stroke.Color = Color3.fromRGB(70, 70, 70)
+    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    stroke.Parent = box
+
+    -- layout horizontal di dalam box
+    local hLayout = Instance.new("UIListLayout")
+    hLayout.Parent = box
+    hLayout.FillDirection = Enum.FillDirection.Horizontal
+    hLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    hLayout.Padding = UDim.new(0, 4)
+    hLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+
+    local padding = Instance.new("UIPadding")
+    padding.Parent = box
+    padding.PaddingLeft = UDim.new(0, 8)
+    padding.PaddingRight = UDim.new(0, 8)
+
+    -- label command (font kode)
+    local cmdLabel = Instance.new("TextLabel")
+    cmdLabel.Name = "CmdLabel"
+    cmdLabel.Parent = box
+    cmdLabel.BackgroundTransparency = 1
+    cmdLabel.Size = UDim2.new(1, -70, 1, 0) -- sisa ruang setelah tombol
+    cmdLabel.Font = Enum.Font.Code
+    cmdLabel.TextSize = 13
+    cmdLabel.TextXAlignment = Enum.TextXAlignment.Left
+    cmdLabel.TextYAlignment = Enum.TextYAlignment.Center
+    cmdLabel.Text = cmdText
+    cmdLabel.TextColor3 = Color3.fromRGB(220, 220, 220)
+    cmdLabel.TextWrapped = false
+    cmdLabel.ClipsDescendants = true
+
+    -- tombol copy
+    local copyBtn = Instance.new("TextButton")
+    copyBtn.Name = "CopyButton"
+    copyBtn.Parent = box
+    copyBtn.AutoButtonColor = true
+    copyBtn.Size = UDim2.new(0, 60, 1, -6)
+    copyBtn.Text = "COPY"
+    copyBtn.Font = Enum.Font.GothamBold
+    copyBtn.TextSize = 13
+    copyBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    copyBtn.BackgroundColor3 = Color3.fromRGB(40, 120, 255)
+
+    local copyCorner = Instance.new("UICorner")
+    copyCorner.CornerRadius = UDim.new(0, 6)
+    copyCorner.Parent = copyBtn
+
+    copyBtn.MouseButton1Click:Connect(function()
+        if typeof(setclipboard) == "function" then
+            setclipboard(cmdText)
+        end
+        pcall(function()
+            copyBtn.Text = "COPIED"
+            task.delay(1.2, function()
+                if copyBtn then
+                    copyBtn.Text = "COPY"
+                end
+            end)
+        end)
+    end)
+end
+
+-- build 2 baris command
+for _, info in ipairs(COMMANDS) do
+    createTermuxCommandRow(body3, info.title, info.cmd)
+end
+
+
+
+    if #sectionSetters >= 1 then
+        sectionSetters[1](true)
+        for i = 2, #sectionSetters do sectionSetters[i](false) end
+    end
+
+    syncReconnectModule()
+end, 4)
+
+
+
+
+
+    --------------------------------------------------
+    -- Subtab Misc lain bisa kamu tambahkan di bawah sini
+    --------------------------------------------------
+end
+
+return M

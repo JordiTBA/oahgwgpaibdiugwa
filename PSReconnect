@@ -1,0 +1,236 @@
+-- PSReconnect.lua
+-- RECONNECT ONLY
+-- âŒ TIDAK AUTO START KG
+-- âŒ TIDAK SENTUH AutoKGLoop
+-- âœ… BOLEH AUTO EXEC SCRIPT (OPSIONAL)
+
+local Players         = game:GetService("Players")
+local TeleportService = game:GetService("TeleportService")
+local CoreGui         = game:GetService("CoreGui")
+local HttpService     = game:GetService("HttpService")
+
+local LP = Players.LocalPlayer
+local M  = {}
+
+----------------------------------------------------------------
+-- PREVENT MULTI LOAD
+----------------------------------------------------------------
+local G = (getgenv and getgenv()) or _G
+if G.__PSRECONNECT_LOADED then
+    return
+end
+G.__PSRECONNECT_LOADED = true
+
+----------------------------------------------------------------
+-- FLAGS
+----------------------------------------------------------------
+local TELEPORT_BLOCKED        = false
+local AUTO_RECONNECT_ENABLED = true
+local AUTO_EXEC_ENABLED      = false
+
+local REJOIN_DELAY_SEC = 10
+local SCRIPT_URL       = "https://gtwaapi.space/sc/auto_kg/MainUI.lua"
+
+----------------------------------------------------------------
+-- FILE READER (autosk/<username>.json)
+----------------------------------------------------------------
+local SAVE_DIR = "autosk"
+local CAN_FS   = (typeof(readfile)=="function" and typeof(isfile)=="function")
+
+local function _safeName(s)
+    s = tostring(s or "player")
+    s = s:gsub("[^%w%-_.]", "_")
+    s = s:gsub("_+", "_")
+    return s:sub(1, 48)
+end
+
+local function _getSaveFile()
+    return ("%s/%s.json"):format(SAVE_DIR, _safeName(LP.Name))
+end
+
+local function readFlagsFromFile()
+    if not CAN_FS then
+        return true, false
+    end
+
+    local f = _getSaveFile()
+    if not isfile(f) then
+        return true, false
+    end
+
+    local ok, txt = pcall(readfile, f)
+    if not ok or txt == "" then
+        return true, false
+    end
+
+    local ok2, data = pcall(HttpService.JSONDecode, HttpService, txt)
+    if not ok2 or type(data) ~= "table" then
+        return true, false
+    end
+
+    local r = data.rejoin or {}
+    return (r.auto_reconnect == true), (r.auto_exec == true)
+end
+
+----------------------------------------------------------------
+-- QUEUE ON TELEPORT (AUTO EXEC ONLY)
+----------------------------------------------------------------
+local qtp = queue_on_teleport
+    or (syn and syn.queue_on_teleport)
+    or (fluxus and fluxus.queue_on_teleport)
+    or (KRNL_LOADED and queue_on_teleport)
+
+if qtp then
+    local chunk = string.format([[
+        local url = %q
+        local Players = game:GetService("Players")
+        local HttpService = game:GetService("HttpService")
+
+        local function safeName(s)
+            s = tostring(s or "player")
+            s = s:gsub("[^%%w%%-_.]", "_")
+            s = s:gsub("_+", "_")
+            return s:sub(1, 48)
+        end
+
+        local CAN_FS = (typeof(readfile)=="function" and typeof(isfile)=="function")
+        if not CAN_FS then return end
+
+        local lp = Players.LocalPlayer
+        if not lp then return end
+
+        local f = ("autosk/%%s.json"):format(safeName(lp.Name))
+        if not isfile(f) then return end
+
+        local ok, txt = pcall(readfile, f)
+        if not ok or txt=="" then return end
+
+        local ok2, data = pcall(HttpService.JSONDecode, HttpService, txt)
+        if not ok2 or type(data)~="table" then return end
+
+        local r = data.rejoin or {}
+        if r.auto_exec == true then
+            pcall(function()
+                loadstring(game:HttpGet(url))()
+            end)
+        end
+    ]], SCRIPT_URL)
+
+    pcall(function()
+        qtp(chunk)
+    end)
+end
+
+----------------------------------------------------------------
+-- INITIAL LOAD FLAGS
+----------------------------------------------------------------
+task.spawn(function()
+    local ar, ax = readFlagsFromFile()
+    AUTO_RECONNECT_ENABLED = ar
+    AUTO_EXEC_ENABLED      = ax
+
+    if AUTO_EXEC_ENABLED then
+        local GG = (getgenv and getgenv()) or _G
+        if GG.__NODEHUB_AUTOEXECED then return end
+        GG.__NODEHUB_AUTOEXECED = true
+
+        pcall(function()
+            loadstring(game:HttpGet(SCRIPT_URL))()
+        end)
+    end
+end)
+
+----------------------------------------------------------------
+-- BLOCK PRIVATE / UNAUTHORIZED TELEPORT
+----------------------------------------------------------------
+TeleportService.TeleportInitFailed:Connect(function(player, result, errMsg)
+    if player ~= LP then return end
+    local m = string.lower(errMsg or "")
+    if result == Enum.TeleportResult.Unauthorized
+        or m:find("restricted")
+        or m:find("private")
+        or m:find("not authorized") then
+        TELEPORT_BLOCKED = true
+    end
+end)
+
+----------------------------------------------------------------
+-- REJOIN CORE
+----------------------------------------------------------------
+local function doTeleport()
+    if TELEPORT_BLOCKED then return end
+    pcall(function()
+        TeleportService:Teleport(game.PlaceId, LP)
+    end)
+end
+
+local function tryRejoin()
+    if not AUTO_RECONNECT_ENABLED then return end
+    if TELEPORT_BLOCKED then return end
+    task.delay(REJOIN_DELAY_SEC, doTeleport)
+end
+
+----------------------------------------------------------------
+-- DISCONNECT DETECTION
+----------------------------------------------------------------
+local function isDisconnectText(t)
+    t = string.lower(t or "")
+    return t:find("error")
+        or t:find("disconnected")
+        or t:find("lost connection")
+        or t:find("kicked")
+        or t:find("reconnect")
+end
+
+local function hookPrompt()
+    task.spawn(function()
+        local gui = CoreGui:WaitForChild("RobloxPromptGui", 30)
+        if not gui then return end
+        local overlay = gui:WaitForChild("promptOverlay", 30)
+        if not overlay then return end
+
+        local function scan()
+            for _, v in ipairs(overlay:GetDescendants()) do
+                if v:IsA("TextLabel") and isDisconnectText(v.Text) then
+                    tryRejoin()
+                    return
+                end
+            end
+        end
+
+        scan()
+        overlay.DescendantAdded:Connect(scan)
+
+        while true do
+            task.wait(1)
+            scan()
+        end
+    end)
+end
+
+hookPrompt()
+
+----------------------------------------------------------------
+-- API FOR UI
+----------------------------------------------------------------
+function M.SetEnabled(flag)
+    AUTO_RECONNECT_ENABLED = not not flag
+end
+
+function M.SetDelay(sec)
+    REJOIN_DELAY_SEC = tonumber(sec) or REJOIN_DELAY_SEC
+end
+
+function M.SetAutoExec(flag)
+    AUTO_EXEC_ENABLED = not not flag
+end
+
+function M.RejoinNow()
+    doTeleport()
+end
+
+function M.IsTeleportBlocked()
+    return TELEPORT_BLOCKED
+end
+
+return M

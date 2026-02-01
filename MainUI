@@ -1,0 +1,2441 @@
+-- NodeHubNeonUI.lua
+-- UI Style B: Kuning - Hitam, Neon Glow, Sidebar kiri, Floating
+-- Dibungkus jadi module "MainUI" supaya tab main & sub tab bisa di-file terpisah.
+
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local LP = Players.LocalPlayer
+local PlayerGui = LP:WaitForChild("PlayerGui")
+local TextService  = game:GetService("TextService") 
+
+-- =========================
+-- COLOR & STYLE CONFIG
+-- =========================
+local COLOR_BG        = Color3.fromRGB(5, 5, 5)
+local COLOR_PANEL     = Color3.fromRGB(10, 10, 10)
+local COLOR_PANEL_ALT = Color3.fromRGB(15, 15, 15)
+local COLOR_YELLOW    = Color3.fromRGB(255, 211, 0) -- #FFD300
+local COLOR_WHITE     = Color3.fromRGB(255, 255, 255)
+local COLOR_GRAY_TEXT = Color3.fromRGB(180, 180, 180)
+
+local SIDEBAR_WIDTH   = 120 -- medium
+local MAIN_W          = 620
+local MAIN_H          = 400
+
+-- =========================
+-- HELPERS
+-- =========================
+local function createStroke(parent, color, thickness, transparency)
+    local s = Instance.new("UIStroke")
+    s.Color = color
+    s.Thickness = thickness or 1
+    s.Transparency = transparency or 0
+    s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    s.Parent = parent
+    return s
+end
+
+local function createCorner(parent, radius)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, radius or 8)
+    c.Parent = parent
+    return c
+end
+
+local function tweenColor(obj, prop, to, time)
+    time = time or 0.12
+    TweenService:Create(obj, TweenInfo.new(time, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+        [prop] = to
+    }):Play()
+end
+
+
+
+local function makeDraggable(frame, dragHandle)
+    dragHandle = dragHandle or frame
+    dragHandle.Active = true            -- penting
+
+    local dragging = false
+    local dragStart
+    local startPos
+
+    dragHandle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging  = true
+            dragStart = input.Position
+            startPos  = frame.Position
+        end
+    end)
+
+    dragHandle.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging  = false
+            dragStart = nil
+            startPos  = nil
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if not dragging then return end
+
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement
+        and input.UserInputType ~= Enum.UserInputType.Touch then
+            return
+        end
+
+        -- ðŸ” Guard biar gak error "attempt to index nil with 'X'"
+        if not dragStart or not startPos then
+            return
+        end
+
+        local delta = input.Position - dragStart
+        frame.Position = UDim2.new(
+            startPos.X.Scale,
+            startPos.X.Offset + delta.X,
+            startPos.Y.Scale,
+            startPos.Y.Offset + delta.Y
+        )
+    end)
+end
+
+
+
+-- =========================
+-- MAINUI CLASS
+-- =========================
+local MainUI = {}
+MainUI.__index = MainUI
+
+function MainUI.new(opts)
+    opts = opts or {}
+    local self = setmetatable({}, MainUI)
+    
+    local iconId = opts.iconId or "rbxassetid://103570401113729"
+
+    -- kalau sudah ada GUI lama, destroy
+    local old = PlayerGui:FindFirstChild("NodeHubNeonUI")
+    local overlay = PlayerGui:FindFirstChild("NodeHubDropdownOverlay")
+    if old then
+        old:Destroy()
+        if overlay then
+        overlay:Destroy()
+        end
+    end
+
+    -- =========================
+    -- ROOT SCREEN GUI
+    -- =========================
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "NodeHubNeonUI"
+    sg.ResetOnSpawn = false
+    sg.IgnoreGuiInset = true
+    sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    sg.DisplayOrder = 9999
+    sg.Parent = PlayerGui
+
+    -- semi-transparent overlay (floating feel)
+    local overlay = Instance.new("Frame")
+    overlay.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    overlay.BackgroundTransparency = 0.35
+    overlay.Size = UDim2.new(1, 0, 1, 0)
+    overlay.Parent = sg
+
+-- Panel utama
+local mainFrame = Instance.new("Frame")
+mainFrame.Size = UDim2.new(0, MAIN_W, 0, MAIN_H)
+mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+mainFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
+mainFrame.BackgroundColor3 = COLOR_PANEL
+mainFrame.Parent = overlay
+
+local GuiService = game:GetService("GuiService")
+
+local uiScale = Instance.new("UIScale")
+uiScale.Parent = mainFrame
+
+
+
+local function clamp(x, a, b)
+    if x < a then return a end
+    if x > b then return b end
+    return x
+end
+
+local function updateScale()
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+
+    local v = cam.ViewportSize
+    if not v or v.X <= 0 or v.Y <= 0 then return end
+
+    -- hitung â€œmuat layarâ€
+    local sx = v.X / MAIN_W
+    local sy = v.Y / MAIN_H
+    local s  = math.min(sx, sy)
+
+    -- âœ… PAKSA: mau layar gede pun, jangan pernah 1.0
+    local MAX_SCALE = 1   -- <-- kamu bisa ubah (0.7 lebih kecil)
+    local MIN_SCALE = 0.35
+
+    if s > MAX_SCALE then s = MAX_SCALE end
+    if s < MIN_SCALE then s = MIN_SCALE end
+    
+    -- snap biar lebih tajam (kurangi blur)
+local step = 0.05 -- coba 0.1 kalau masih blur
+s = math.floor((s / step) + 0.5) * step
+
+
+    uiScale.Scale = s
+
+    -- debug sekali buat buktiin berubah
+    -- print("[NodeHub] UIScale =", uiScale.Scale, "Viewport=", v.X, v.Y)
+end
+
+
+
+local viewportConn
+local function bindCamera(cam)
+    if viewportConn then viewportConn:Disconnect() end
+    if not cam then return end
+    viewportConn = cam:GetPropertyChangedSignal("ViewportSize"):Connect(updateScale)
+end
+
+bindCamera(workspace.CurrentCamera)
+updateScale()
+
+workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+    bindCamera(workspace.CurrentCamera)
+    updateScale()
+end)
+
+-- âœ… jaga-jaga: beberapa game update viewport belakangan
+task.defer(updateScale)
+task.delay(0.2, updateScale)
+
+----------------------------------------------------------------
+
+mainFrame.Active = true
+createCorner(mainFrame, 10)
+createStroke(mainFrame, COLOR_YELLOW, 1, 0.25)
+
+
+    -- =========================
+    -- HEADER
+    -- =========================
+    local header = Instance.new("Frame")
+    header.BackgroundColor3 = COLOR_PANEL
+    header.BackgroundTransparency = 1
+    header.Position = UDim2.new(0, 0, 0, 3)
+    header.Size = UDim2.new(1, 0, 0, 28)
+    header.Parent = mainFrame
+    header.Active = true
+    createCorner(header, 10)
+
+    -- ICON di kiri
+    local iconImg = Instance.new("ImageLabel")
+    iconImg.Name = "Logo"
+    iconImg.BackgroundTransparency = 1
+    iconImg.Size = UDim2.new(0, 20, 0, 20)
+    iconImg.Position = UDim2.new(0, 8, 0.5, -10)
+    iconImg.Image = iconId
+    iconImg.Parent = header
+
+    -- TITLE di samping icon
+    local title = Instance.new("TextLabel")
+    title.BackgroundTransparency = 1
+    title.Size = UDim2.new(1, -40, 1, 0)
+    title.Position = UDim2.new(0, 34, 0, 0) -- digeser dikit, biar gak nabrak icon
+    title.Font = Enum.Font.GothamBlack
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.TextSize = 16
+    title.TextColor3 = COLOR_YELLOW
+    title.Text = opts.title or "âš¡ NODE HUB"
+    title.Parent = header
+
+
+    -- Close button kecil (opsional)
+    -- Close button kecil (opsional)
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Size = UDim2.new(0, 24, 0, 24)
+    closeBtn.Position = UDim2.new(1, -30, 0.5, -12)
+    closeBtn.BackgroundColor3 = COLOR_PANEL
+    closeBtn.Text = "-"  -- tombol minimize
+    closeBtn.TextColor3 = COLOR_WHITE
+    closeBtn.Font = Enum.Font.GothamBold
+    closeBtn.TextSize = 14
+    closeBtn.Parent = header
+    createCorner(closeBtn, 8)
+    createStroke(closeBtn, COLOR_YELLOW, 1, 0.5)
+
+
+
+    -- =========================
+    -- BODY (SIDEBAR + RIGHT)
+    -- =========================
+    local body = Instance.new("Frame")
+    body.BackgroundTransparency = 1
+    body.Size = UDim2.new(1, 0, 1, -32)
+    body.Position = UDim2.new(0, 0, 0, 32)
+    body.Parent = mainFrame
+
+    -- SIDEBAR
+    local sidebar = Instance.new("Frame")
+    sidebar.BackgroundColor3 = COLOR_PANEL
+    sidebar.Size = UDim2.new(0, SIDEBAR_WIDTH, 1, -8)
+    sidebar.Position = UDim2.new(0, 4, 0, 4)
+    sidebar.Parent = body
+    createCorner(sidebar, 10)
+    createStroke(sidebar, COLOR_YELLOW, 1, 0.6)
+
+    local sideList = Instance.new("UIListLayout")
+    sideList.FillDirection = Enum.FillDirection.Vertical
+    sideList.SortOrder = Enum.SortOrder.LayoutOrder
+    sideList.Padding = UDim.new(0, 4)
+    sideList.Parent = sidebar
+
+    local sidePad = Instance.new("UIPadding")
+    sidePad.PaddingTop    = UDim.new(0, 8)
+    sidePad.PaddingLeft   = UDim.new(0, 8)
+    sidePad.PaddingRight  = UDim.new(0, 8)
+    sidePad.PaddingBottom = UDim.new(0, 8)
+    sidePad.Parent = sidebar
+
+    -- RIGHT PANEL
+    local right = Instance.new("Frame")
+    right.BackgroundColor3 = COLOR_PANEL
+    right.Size = UDim2.new(1, -SIDEBAR_WIDTH - 13, 1, -8)
+    right.Position = UDim2.new(0, SIDEBAR_WIDTH + 10, 0, 4)
+    right.Parent = body
+    createCorner(right, 10)
+    createStroke(right, COLOR_YELLOW, 1, 0.3)
+
+    -- Subtab bar
+    local subBar = Instance.new("Frame")
+    subBar.BackgroundTransparency = 1
+    subBar.Size = UDim2.new(1, -16, 0, 28)
+    subBar.Position = UDim2.new(0, 8, 0, 6)
+    subBar.Parent = right
+
+    local subLayout = Instance.new("UIListLayout")
+    subLayout.FillDirection = Enum.FillDirection.Horizontal
+    subLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    subLayout.Padding = UDim.new(0, 6)
+    subLayout.Parent = subBar
+
+    -- Content
+-- Content (SCROLLING)
+local content = Instance.new("ScrollingFrame")
+content.BackgroundColor3 = COLOR_PANEL
+content.Size = UDim2.new(1, -16, 1, -76)
+content.Position = UDim2.new(0, 8, 0, 40)
+content.ScrollBarThickness = 4
+content.ScrollBarImageTransparency = 0
+content.BorderSizePixel = 0
+content.ClipsDescendants = true
+content.AutomaticCanvasSize = Enum.AutomaticSize.Y
+content.CanvasSize = UDim2.new(0, 0, 0, 0) -- di-auto oleh AutomaticCanvasSize
+content.Parent = right
+createCorner(content, 10)
+createStroke(content, COLOR_YELLOW, 1, 0.4)
+
+local contentPad = Instance.new("UIPadding")
+contentPad.PaddingTop = UDim.new(0, 8)
+contentPad.PaddingLeft = UDim.new(0, 8)
+contentPad.PaddingRight = UDim.new(0, 8)
+contentPad.Parent = content
+
+local contentLayout = Instance.new("UIListLayout")
+contentLayout.FillDirection = Enum.FillDirection.Vertical
+contentLayout.SortOrder = Enum.SortOrder.LayoutOrder
+contentLayout.Padding = UDim.new(0, 6)
+contentLayout.Parent = content
+
+
+
+    -- Footer
+    local footer = Instance.new("Frame")
+    footer.BackgroundTransparency = 1
+    footer.Size = UDim2.new(1, -16, 0, 26)
+    footer.Position = UDim2.new(0, 8, 1, -30)
+    footer.Parent = right
+
+    local footerLayout = Instance.new("UIListLayout")
+    footerLayout.FillDirection = Enum.FillDirection.Horizontal
+    footerLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    footerLayout.Padding = UDim.new(0, 6)
+    footerLayout.HorizontalAlignment = Enum.HorizontalAlignment.Left
+    footerLayout.Parent = footer
+
+    -- simpan ke self
+    -- simpan ke self
+    self._sg           = sg
+    self.overlay       = overlay
+    self.mainFrame     = mainFrame
+    self.header        = header
+    self.titleLabel    = title
+    self.sidebar       = sidebar
+    self.right         = right
+    self.subBar        = subBar
+    self.content       = content
+    --self.contentLabel  = contentLabel
+    self.footer        = footer
+
+    self.mainTabButtons = {}
+    self.subTabButtons  = {}
+    self.mainTabs       = {}  -- [key] = {label, order}
+    self.subTabs        = {}  -- [mainKey][subKey] = {label, order, builder}
+    self.footerButtons  = {}
+
+    self.activeMainKey  = nil
+    self.activeSubKey   = nil
+    self.footerConfig = {
+        default = nil,
+    }
+    
+    -- setelah self.content dan self.footer dibuat & di-Parent
+self._footerHeight = self.footer.Size.Y.Offset   -- misal 32 / 36 px (pakai yang ada sekarang)
+
+-- simpan size content saat footer ON (default)
+self._contentSizeWithFooter = self.content.Size
+
+-- versi tanpa footer: tambahin tinggi footer ke offset Y
+self._contentSizeNoFooter = UDim2.new(
+    self.content.Size.X.Scale,
+    self.content.Size.X.Offset,
+    self.content.Size.Y.Scale,
+    self.content.Size.Y.Offset + self._footerHeight
+)
+
+
+    -- state minimize
+    -- state minimize
+    self.isMinimized = false
+
+    -- Icon kecil (minimized) di pojok kiri bawah
+    -- Icon kecil (minimized) di pojok kiri bawah
+    local miniBtn = Instance.new("ImageButton")
+    miniBtn.Name = "NodeHubMiniIcon"
+    miniBtn.Size = UDim2.new(0, 40, 0, 40)
+    miniBtn.AnchorPoint = Vector2.new(0, 1)
+    miniBtn.Position = UDim2.new(0, 16, 1, -16)
+    miniBtn.BackgroundColor3 = COLOR_PANEL
+    miniBtn.AutoButtonColor = false
+    miniBtn.BorderSizePixel = 0
+    miniBtn.Image = iconId
+    miniBtn.ScaleType = Enum.ScaleType.Fit
+    miniBtn.Visible = false
+    miniBtn.ZIndex = 100
+    miniBtn.Parent = sg
+    createCorner(miniBtn, 12)
+    createStroke(miniBtn, COLOR_YELLOW, 1, 0.4)
+
+
+
+    self._miniBtn = miniBtn
+
+    -- drag mainFrame pakai header
+    makeDraggable(mainFrame, header)
+
+    -- klik tombol "-" â†’ minimize
+    closeBtn.MouseButton1Click:Connect(function()
+       -- print("[NodeHub] Minimize clicked")       -- DEBUG
+        self:_setMinimized(true)
+    end)
+
+    -- klik icon kecil â†’ restore
+    miniBtn.MouseButton1Click:Connect(function()
+     --   print("[NodeHub] Restore clicked")        -- DEBUG
+        self:_setMinimized(false)
+    end)
+
+    return self
+
+
+end
+
+-- ======================
+-- INTERNAL: UPDATE LABEL
+-- ======================
+function MainUI:_updateContentLabel()
+    local mainKey = self.activeMainKey or "-"
+    local subKey  = self.activeSubKey or "-"
+    --self.contentLabel.Text = string.format("Content: MainTab = %s | SubTab = %s", mainKey, subKey)
+end
+
+-- ======================
+-- API: REGISTER MAIN TAB
+-- ======================
+function MainUI:RegisterMainTab(key, label, order)
+    if self.mainTabButtons[key] then
+        return -- sudah ada
+    end
+
+    self.mainTabs[key] = {
+        label = label or key,
+        order = order or 1,
+    }
+
+    local btn = Instance.new("TextButton")
+    btn.Name = "Tab_" .. key
+    btn.Size = UDim2.new(1, 0, 0, 26)
+    btn.BackgroundColor3 = COLOR_PANEL
+    btn.AutoButtonColor = false
+    btn.Font = Enum.Font.GothamBold
+    btn.Text = string.upper(label or key)
+    btn.BorderSizePixel = 0
+    btn.TextSize = 12
+    btn.TextXAlignment = Enum.TextXAlignment.Center
+    btn.TextColor3 = COLOR_WHITE
+    btn.LayoutOrder = order or 1
+    btn.Parent = self.sidebar
+
+    local pad = Instance.new("UIPadding")
+    pad.PaddingLeft = UDim.new(0, 0)
+    pad.Parent = btn
+
+    local underline = Instance.new("Frame")
+    underline.Name = "Underline"
+    underline.BackgroundColor3 = COLOR_YELLOW
+    underline.Size = UDim2.new(0, 0, 0, 2)
+    underline.Position = UDim2.new(0, 8, 1, -2)
+    underline.BorderSizePixel = 0
+    underline.BackgroundTransparency = 0.35
+    underline.Parent = btn
+
+    self.mainTabButtons[key] = btn
+
+    btn.MouseEnter:Connect(function()
+        if self.activeMainKey ~= key then
+            tweenColor(btn, "TextColor3", COLOR_YELLOW)
+        end
+    end)
+
+    btn.MouseLeave:Connect(function()
+        if self.activeMainKey ~= key then
+            tweenColor(btn, "TextColor3", COLOR_WHITE)
+        end
+    end)
+
+    btn.MouseButton1Click:Connect(function()
+        self:SetActiveMainTab(key)
+    end)
+end
+
+-- ======================
+-- API: REGISTER SUB TAB
+-- ======================
+function MainUI:RegisterSubTab(mainKey, subKey, label, builderFn, order)
+    self.subTabs[mainKey] = self.subTabs[mainKey] or {}
+    self.subTabs[mainKey][subKey] = {
+        label   = label or subKey,
+        order   = order or 1,
+        builder = builderFn,
+    }
+
+    -- kalau mainKey sedang aktif, rebuild bar subtab
+    if self.activeMainKey == mainKey then
+        self:_rebuildSubTabs(mainKey)
+    end
+end
+
+-- INTERNAL: rebuild bar sub tab untuk 1 mainKey
+-- INTERNAL: rebuild bar sub tab untuk 1 mainKey
+function MainUI:_rebuildSubTabs(mainKey)
+    -- hapus tombol lama
+    for _, child in ipairs(self.subBar:GetChildren()) do
+        if child:IsA("TextButton") then
+            child:Destroy()
+        end
+    end
+    self.subTabButtons = {}
+
+    local list = self.subTabs[mainKey]
+    if not list then return end
+
+    -- sort by order
+    local arr = {}
+    for sk, info in pairs(list) do
+        table.insert(arr, { key = sk, info = info })
+    end
+    table.sort(arr, function(a,b)
+        return (a.info.order or 1) < (b.info.order or 1)
+    end)
+
+    ----------------------------------------------------------------
+    -- AUTO WIDTH: makin banyak sub tab â†’ makin kecil
+    ----------------------------------------------------------------
+    local count = #arr
+    local baseWidth = 80
+    local minWidth  = 73
+    local maxWidth  = 120
+    local btnWidth  = baseWidth
+
+    if count > 0 then
+        if count <= 4 then
+            btnWidth = baseWidth
+        else
+            local shrinkStep = 8
+            btnWidth = baseWidth - (count - 4) * shrinkStep
+        end
+        btnWidth = math.clamp(btnWidth, minWidth, maxWidth)
+    end
+
+    ----------------------------------------------------------------
+    -- BUILD BUTTONS: style D (glow border)
+    ----------------------------------------------------------------
+    for _, item in ipairs(arr) do
+        local subKey = item.key
+        local info   = item.info
+
+        local btn = Instance.new("TextButton")
+        btn.Name = "Sub_" .. subKey
+        btn.AutoButtonColor = false
+        btn.Size = UDim2.new(0, btnWidth, 1, 0)
+        btn.BackgroundColor3 = COLOR_PANEL          -- gelap, menyatu dengan bar
+        btn.BorderSizePixel = 0
+        btn.Text = info.label
+        btn.TextSize = 12
+        btn.Font = Enum.Font.GothamBold
+        btn.TextTruncate = Enum.TextTruncate.AtEnd
+        btn.TextColor3 = COLOR_GRAY_TEXT            -- non-aktif default
+        btn.LayoutOrder = info.order or 1
+        btn.Parent = self.subBar
+        createCorner(btn, 999)
+
+        -- border neon / ghost
+        local stroke = createStroke(btn, Color3.fromRGB(90,90,90), 1, 0.5)
+        -- Transparency 0.5 â†’ ghost, non-aktif
+
+        self.subTabButtons[subKey] = {
+            button = btn,
+            stroke = stroke,
+        }
+
+        -- hover effect: sedikit terang kalau belum aktif
+        btn.MouseEnter:Connect(function()
+            if self.activeSubKey ~= subKey then
+                tweenColor(btn, "TextColor3", Color3.fromRGB(220,220,220))
+                stroke.Transparency = 0.3
+            end
+        end)
+
+        btn.MouseLeave:Connect(function()
+            if self.activeSubKey ~= subKey then
+                tweenColor(btn, "TextColor3", COLOR_GRAY_TEXT)
+                stroke.Transparency = 0.5
+            end
+        end)
+
+        btn.MouseButton1Click:Connect(function()
+            self:_setActiveSubTab(mainKey, subKey)
+        end)
+    end
+end
+
+
+function MainUI:_applySubTabVisual(activeSubKey)
+    local style = self.subTabStyle or "pill"
+
+        ----------------------------------------------------------------
+    -- STYLE D: glow neon capsule border
+    ----------------------------------------------------------------
+    for sKey, pack in pairs(self.subTabButtons) do
+        local btn    = pack.button
+        local stroke = pack.stroke
+
+        if sKey == subKey then
+            -- ðŸ”¥ AKTIF â†’ border neon kuning, teks kuning
+            tweenColor(btn, "BackgroundColor3", Color3.fromRGB(16,16,16))
+            tweenColor(btn, "TextColor3", COLOR_YELLOW)
+
+            if stroke then
+                stroke.Color        = COLOR_YELLOW
+                stroke.Thickness    = 2
+                stroke.Transparency = 0     -- full terlihat
+            end
+        else
+            -- ðŸŒ‘ NON-AKTIF â†’ border abu ghost, teks abu
+            tweenColor(btn, "BackgroundColor3", COLOR_PANEL)
+            tweenColor(btn, "TextColor3", COLOR_GRAY_TEXT)
+
+            if stroke then
+                stroke.Color        = Color3.fromRGB(90,90,90)
+                stroke.Thickness    = 1
+                stroke.Transparency = 0.5   -- ghost
+            end
+        end
+    end
+
+end
+
+-- ======================
+-- API: SET ACTIVE MAIN TAB
+-- ======================
+function MainUI:SetActiveMainTab(key)
+    self.activeMainKey = key
+
+    for name, btn in pairs(self.mainTabButtons) do
+        local underline = btn:FindFirstChild("Underline")
+        if name == key then
+            tweenColor(btn, "TextColor3", COLOR_YELLOW)
+            if underline then
+                underline.Size = UDim2.new(1, -16, 0, 2)
+                underline.BackgroundTransparency = 0
+            end
+        else
+            tweenColor(btn, "TextColor3", COLOR_WHITE)
+            if underline then
+                underline.Size = UDim2.new(0, 0, 0, 2)
+                underline.BackgroundTransparency = 0.35
+            end
+        end
+    end
+
+    self:_rebuildSubTabs(key)
+
+    -- pick pertama berdasarkan order
+    local list = self.subTabs[key]
+    if list then
+        local firstKey
+        local firstOrder = math.huge
+        for sk, info in pairs(list) do
+            local o = info.order or 1
+            if o < firstOrder then
+                firstOrder = o
+                firstKey = sk
+            end
+        end
+        if firstKey then
+            self:_setActiveSubTab(key, firstKey)
+        end
+    end
+
+    local footerList = self.footerConfig[key] or self.footerConfig.default
+self:_renderFooter(footerList)
+self:_updateContentLabel()
+end
+
+-- INTERNAL: set active sub tab + panggil builder
+function MainUI:_setActiveSubTab(mainKey, subKey)
+    self.activeSubKey = subKey
+
+    ----------------------------------------------------------------
+    -- STYLE D: glow neon capsule border
+    ----------------------------------------------------------------
+    for sKey, pack in pairs(self.subTabButtons) do
+        local btn    = pack.button
+        local stroke = pack.stroke
+
+        if sKey == subKey then
+            -- ðŸ”¥ AKTIF â†’ border neon kuning, teks kuning
+            tweenColor(btn, "BackgroundColor3", Color3.fromRGB(16,16,16))
+            tweenColor(btn, "TextColor3", COLOR_YELLOW)
+
+            if stroke then
+                stroke.Color        = COLOR_YELLOW
+                stroke.Thickness    = 2
+                stroke.Transparency = 0     -- full terlihat
+            end
+        else
+            -- ðŸŒ‘ NON-AKTIF â†’ border abu ghost, teks abu
+            tweenColor(btn, "BackgroundColor3", COLOR_PANEL)
+            tweenColor(btn, "TextColor3", COLOR_GRAY_TEXT)
+
+            if stroke then
+                stroke.Color        = Color3.fromRGB(90,90,90)
+                stroke.Thickness    = 1
+                stroke.Transparency = 0.5   -- ghost
+            end
+        end
+    end
+
+    ----------------------------------------------------------------
+    -- sisanya tetap sama
+    ----------------------------------------------------------------
+    self:ClearSubContent()
+
+    local info = self.subTabs[mainKey] and self.subTabs[mainKey][subKey]
+    if info and info.builder then
+        info.builder()
+    end
+
+    self:_updateContentLabel()
+end
+
+
+-- ======================
+-- API: CLEAR SUB CONTENT
+-- ======================
+function MainUI:ClearSubContent()
+    for _, child in ipairs(self.content:GetChildren()) do
+        if child ~= self.contentLabel and not child:IsA("UIListLayout") and not child:IsA("UIPadding") then
+            child:Destroy()
+        end
+    end
+end
+
+
+function MainUI:CreateSection(title, defaultExpanded)
+    title = title or "Section"
+
+    -- kalau nggak diisi, sementara default = true
+    if defaultExpanded == nil then
+        defaultExpanded = true
+    end
+
+    -- Root section frame (auto height)
+    local section = Instance.new("Frame")
+    section.Name = "Section_" .. title
+    section.BackgroundTransparency = 1
+    section.Size = UDim2.new(1, 0, 0, 0)
+    section.AutomaticSize = Enum.AutomaticSize.Y
+    section.LayoutOrder = #self.content:GetChildren() + 1
+    section.Parent = self.content
+
+    -- Header (clickable, buat buka/tutup)
+    local header = Instance.new("TextButton")
+    header.Name = "Header"
+    header.AutoButtonColor = false
+    header.BackgroundColor3 = COLOR_PANEL_ALT
+    header.Size = UDim2.new(1, 0, 0, 26)
+    header.Text = ""
+    header.BorderSizePixel = 0
+    header.Parent = section
+    createCorner(header, 8)
+    createStroke(header, COLOR_YELLOW, 1, 0.3)
+
+    -- Title label kiri
+    local titleLabel = Instance.new("TextLabel")
+    titleLabel.Name = "Title"
+    titleLabel.BackgroundTransparency = 1
+    titleLabel.Size = UDim2.new(1, -40, 1, 0)
+    titleLabel.Position = UDim2.new(0, 10, 0, 0)
+    titleLabel.Font = Enum.Font.GothamBold
+    titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    titleLabel.TextSize = 13
+    titleLabel.TextColor3 = COLOR_YELLOW
+    titleLabel.Text = title
+    titleLabel.Parent = header
+
+    -- Icon panah kanan (â–¶ / â–¼)
+    local arrow = Instance.new("TextLabel")
+    arrow.Name = "Arrow"
+    arrow.BackgroundTransparency = 1
+    arrow.Size = UDim2.new(0, 20, 1, 0)
+    arrow.Position = UDim2.new(1, -26, 0, 0)
+    arrow.Font = Enum.Font.GothamBold
+    arrow.TextSize = 14
+    arrow.TextXAlignment = Enum.TextXAlignment.Center
+    arrow.TextColor3 = COLOR_GRAY_TEXT
+    arrow.Text = "â–¼"
+    arrow.Parent = header
+
+    -- Body tempat isi section nanti
+    local body = Instance.new("Frame")
+    body.Name = "Body"
+    body.BackgroundTransparency = 1
+    body.Size = UDim2.new(1, 0, 0, 0)
+    body.Position = UDim2.new(0, 0, 0, 28)
+    body.AutomaticSize = Enum.AutomaticSize.Y
+    body.ClipsDescendants = true
+    body.Parent = section
+
+    local bodyPad = Instance.new("UIPadding")
+    bodyPad.PaddingTop = UDim.new(0, 4)
+    bodyPad.PaddingBottom = UDim.new(0, 4)
+    bodyPad.PaddingLeft = UDim.new(0, 8)
+    bodyPad.PaddingRight = UDim.new(0, 4)
+    bodyPad.Parent = body
+
+    local bodyLayout = Instance.new("UIListLayout")
+    bodyLayout.FillDirection = Enum.FillDirection.Vertical
+    bodyLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    bodyLayout.Padding = UDim.new(0, 4)
+    bodyLayout.Parent = body
+
+    -- state buka/tutup
+    local expanded = defaultExpanded
+
+    local function setExpanded(on)
+        expanded = on
+        body.Visible = on
+        arrow.Text = on and "â–¼" or "â–¶"
+
+        if on then
+            tweenColor(header, "BackgroundColor3", COLOR_PANEL_ALT)
+            tweenColor(titleLabel, "TextColor3", COLOR_YELLOW)
+        else
+            tweenColor(header, "BackgroundColor3", Color3.fromRGB(18,18,18))
+            tweenColor(titleLabel, "TextColor3", COLOR_GRAY_TEXT)
+        end
+    end
+
+    -- klik header â†’ toggle
+    header.MouseButton1Click:Connect(function()
+        setExpanded(not expanded)
+    end)
+
+    -- hover effect halus
+    header.MouseEnter:Connect(function()
+        if expanded then
+            tweenColor(header, "BackgroundColor3", Color3.fromRGB(22,22,22))
+        else
+            tweenColor(header, "BackgroundColor3", Color3.fromRGB(24,24,24))
+        end
+    end)
+
+    header.MouseLeave:Connect(function()
+        if expanded then
+            tweenColor(header, "BackgroundColor3", COLOR_PANEL_ALT)
+        else
+            tweenColor(header, "BackgroundColor3", Color3.fromRGB(18,18,18))
+        end
+    end)
+
+    -- set awal
+    setExpanded(defaultExpanded)
+
+    -- â¬…ï¸ sekarang return 2 hal: body & fungsi setExpanded
+    return body, setExpanded
+end
+
+
+
+----------------------------------------------------------
+-- ROW: LABEL (optional description)
+----------------------------------------------------------
+function MainUI:CreateRowLabel(parent, text, desc, order)
+    local row = Instance.new("Frame")
+    row.Name = "RowLabel"
+    row.BackgroundTransparency = 1
+    row.Size = UDim2.new(1, 0, 0, desc and 34 or 22)
+    row.AutomaticSize = Enum.AutomaticSize.None
+    row.LayoutOrder = order or (#parent:GetChildren() + 1)
+    row.Parent = parent
+
+    local title = Instance.new("TextLabel")
+    title.BackgroundTransparency = 1
+    title.Position = UDim2.new(0, 0, 0, 0)
+    title.Size = UDim2.new(1, 0, 0, 18)
+    title.Font = Enum.Font.Gotham
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.TextSize = 12
+    title.TextColor3 = COLOR_GRAY_TEXT
+    title.Text = text or ""
+    title.Parent = row
+
+    if desc and desc ~= "" then
+        local sub = Instance.new("TextLabel")
+        sub.BackgroundTransparency = 1
+        sub.Position = UDim2.new(0, 0, 0, 18)
+        sub.Size = UDim2.new(1, 0, 0, 14)
+        sub.Font = Enum.Font.Gotham
+        sub.TextXAlignment = Enum.TextXAlignment.Left
+        sub.TextSize = 11
+        sub.TextColor3 = Color3.fromRGB(120,120,120)
+        sub.Text = desc
+        sub.Parent = row
+    end
+
+    -- â¬…ï¸ Tambah return kedua (title)
+    return row, title
+end
+
+
+----------------------------------------------------------
+-- ROW: TOGGLE (pill kanan)
+----------------------------------------------------------
+function MainUI:CreateRowToggle(parent, labelText, initial, onChanged, order)
+    local row = Instance.new("Frame")
+    row.Name = "RowToggle"
+    row.BackgroundTransparency = 1
+    row.Size = UDim2.new(1, 0, 0, 26)
+    row.LayoutOrder = order or (#parent:GetChildren() + 1)
+    row.Parent = parent
+
+    local label = Instance.new("TextLabel")
+    label.Name = "Label"
+    label.BackgroundTransparency = 1
+    label.Position = UDim2.new(0, 0, 0, 0)
+    label.Size = UDim2.new(1, -70, 1, 0)
+    label.Font = Enum.Font.Gotham
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextSize = 12
+    label.TextColor3 = COLOR_GRAY_TEXT
+    label.Text = labelText or "Toggle"
+    label.Parent = row
+
+    local toggleBtn = Instance.new("TextButton")
+    toggleBtn.Name = "Toggle"
+    toggleBtn.AutoButtonColor = false
+    toggleBtn.BackgroundColor3 = Color3.fromRGB(30,30,30)
+    toggleBtn.Size = UDim2.new(0, 48, 0, 20)
+    toggleBtn.Position = UDim2.new(1, -52, 0.5, -10)
+    toggleBtn.Text = ""
+    toggleBtn.BorderSizePixel = 0
+    toggleBtn.Parent = row
+    createCorner(toggleBtn, 10)
+    createStroke(toggleBtn, Color3.fromRGB(60,60,60), 1, 0.6)
+
+    local knob = Instance.new("Frame")
+    knob.Name = "Knob"
+    knob.Size = UDim2.new(0, 18, 0, 18)
+    knob.Position = UDim2.new(0, 1, 0, 1)
+    knob.BackgroundColor3 = Color3.fromRGB(220,220,220)
+    knob.BorderSizePixel = 0
+    knob.Parent = toggleBtn
+    createCorner(knob, 9)
+
+    local state = initial and true or false
+
+    local function applyState(animate)
+        if state then
+            if animate then
+                tweenColor(toggleBtn, "BackgroundColor3", COLOR_YELLOW)
+            else
+                toggleBtn.BackgroundColor3 = COLOR_YELLOW
+            end
+            knob.Position = UDim2.new(1, -19, 0, 1)
+        else
+            if animate then
+                tweenColor(toggleBtn, "BackgroundColor3", Color3.fromRGB(30,30,30))
+            else
+                toggleBtn.BackgroundColor3 = Color3.fromRGB(30,30,30)
+            end
+            knob.Position = UDim2.new(0, 1, 0, 1)
+        end
+    end
+
+    applyState(false)
+
+    toggleBtn.MouseButton1Click:Connect(function()
+        state = not state
+        applyState(true)
+        if onChanged then
+            onChanged(state)
+        end
+    end)
+
+    -- getter/setter
+    local function setGet(value)
+        if value ~= nil then
+            state = value and true or false
+            applyState(false)
+        end
+        return state
+    end
+
+    return row, setGet
+end
+
+----------------------------------------------------------
+-- ROW: INPUT (text box dengan label kiri)
+-- FIX:
+--  âœ… text tidak keluar box (clip + padding)
+--  âœ… bisa truncate "..." kalau kepanjangan
+--  âœ… clearOnFocus opsional (arg5 boolean)
+--  âœ… kalau clearOnFocus=false dan user klik doang (tanpa ngetik),
+--     value BALIK ke currentValue (tidak jadi kosong)
+--  âœ… allow empty kalau user memang sengaja mengosongkan (touched=true)
+--
+-- Signature:
+--   CreateRowInput(parent, label, defaultText, onChanged, [clearOnFocusOrOrder], [maybeOrder])
+--   arg5 number  => order
+--   arg5 boolean => clearOnFocus (true=clear seperti lama, false=tidak clear)
+----------------------------------------------------------
+function MainUI:CreateRowInput(parent, labelText, defaultText, onChanged, noClearOrOrder, maybeOrder)
+    local order = nil
+    local clearOnFocus = true
+
+    if type(noClearOrOrder) == "number" then
+        order = noClearOrOrder
+    elseif type(noClearOrOrder) == "boolean" then
+        clearOnFocus = (noClearOrOrder == true)
+        order = maybeOrder
+    else
+        clearOnFocus = true
+        order = maybeOrder
+    end
+
+    local row = Instance.new("Frame")
+    row.Name = "RowInput"
+    row.BackgroundTransparency = 1
+    row.Size = UDim2.new(1, 0, 0, 28)
+    row.LayoutOrder = order or (#parent:GetChildren() + 1)
+    row.Parent = parent
+
+    local label = Instance.new("TextLabel")
+    label.Name = "Label"
+    label.BackgroundTransparency = 1
+    label.Position = UDim2.new(0, 0, 0, 0)
+    label.Size = UDim2.new(0.6, 0, 1, 0)
+    label.Font = Enum.Font.Gotham
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextSize = 12
+    label.TextColor3 = COLOR_GRAY_TEXT
+    label.Text = labelText or "Input"
+    label.Parent = row
+
+    local currentValue = (defaultText ~= nil) and tostring(defaultText) or ""
+    local beforeFocusValue = currentValue
+
+    local box = Instance.new("TextBox")
+    box.Name = "Input"
+    box.BackgroundColor3 = Color3.fromRGB(18,18,18)
+    box.Size = UDim2.new(0.2, 0, 1, -5)
+    box.Position = UDim2.new(0.79, 4, 0, 3)
+    box.Font = Enum.Font.Gotham
+    box.TextXAlignment = Enum.TextXAlignment.Center
+    box.ClearTextOnFocus = false -- biar kita kontrol sendiri
+    box.TextSize = 12
+    box.TextColor3 = Color3.fromRGB(230,230,230)
+    box.PlaceholderText = ""
+    box.ClipsDescendants = true
+    box.Parent = row
+
+    local pad = Instance.new("UIPadding")
+    pad.PaddingLeft  = UDim.new(0, 6)
+    pad.PaddingRight = UDim.new(0, 6)
+    pad.Parent = box
+
+    pcall(function()
+        box.TextTruncate = Enum.TextTruncate.AtEnd
+    end)
+
+    createCorner(box, 6)
+    createStroke(box, Color3.fromRGB(60,60,60), 1, 0.6)
+
+    local function trim(s)
+        return (s and s:match("^%s*(.-)%s*$")) or ""
+    end
+
+    -- touched detection (lebih aman)
+    local touched = false
+    local internalSet = false
+
+    local function setBoxText(v)
+        internalSet = true
+        box.Text = v
+        internalSet = false
+    end
+
+    setBoxText(currentValue)
+
+    box:GetPropertyChangedSignal("Text"):Connect(function()
+        if not box:IsFocused() then return end
+        if internalSet then return end
+        -- setiap perubahan dari user (ketik / paste) â†’ tandai
+        touched = true
+    end)
+
+    box.Focused:Connect(function()
+        tweenColor(box, "BackgroundColor3", Color3.fromRGB(24,24,24))
+        beforeFocusValue = currentValue
+        touched = false
+
+        if clearOnFocus and trim(box.Text) == trim(currentValue) then
+            setBoxText("")
+        end
+    end)
+
+    box.FocusLost:Connect(function(enterPressed)
+        tweenColor(box, "BackgroundColor3", Color3.fromRGB(18,18,18))
+
+        local newText = trim(box.Text)
+
+        -- kalau user gak ngetik / paste apa-apa, balikin nilai lama
+        if not touched then
+            setBoxText(currentValue)
+            return
+        end
+
+        -- kosong valid hanya kalau user beneran ngedit/hapus
+        if newText == "" then
+            if currentValue ~= "" then
+                currentValue = ""
+                setBoxText("")
+                if onChanged then onChanged(currentValue) end
+            else
+                setBoxText("")
+            end
+            return
+        end
+
+        if newText == currentValue then
+            setBoxText(currentValue)
+            return
+        end
+
+        currentValue = newText
+        setBoxText(currentValue)
+        if onChanged then onChanged(currentValue) end
+    end)
+
+    -- setter/getter
+    local function setGet(value)
+        if value ~= nil then
+            currentValue = tostring(value)
+            setBoxText(currentValue)
+        end
+        return currentValue
+    end
+
+    return row, setGet
+end
+
+
+----------------------------------------------------------
+-- ROW: SIMPLE LIST (list of toggle-buttons)
+-- entries: { "Item A", "Item B", ... } atau
+--          { {name="Item A", key="a"}, ... }
+----------------------------------------------------------
+function MainUI:CreateRowList(parent, titleText, entries, onItemToggle, order)
+    entries      = entries or {}
+    onItemToggle = onItemToggle or function() end
+
+    --------------------------------------------------
+    -- ROW + TITLE
+    --------------------------------------------------
+    local row = Instance.new("Frame")
+    row.Name = "RowList"
+    row.BackgroundTransparency = 1
+    row.Size = UDim2.new(1, 0, 0, 0)
+    row.AutomaticSize = Enum.AutomaticSize.Y
+    row.LayoutOrder = order or (#parent:GetChildren() + 1)
+    row.Parent = parent
+
+    local title = Instance.new("TextLabel")
+    title.Name = "Title"
+    title.BackgroundTransparency = 1
+    title.Position = UDim2.new(0, 0, 0, 0)
+    title.Size = UDim2.new(1, 0, 0, 18)
+    title.Font = Enum.Font.Gotham
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.TextSize = 12
+    title.TextColor3 = COLOR_GRAY_TEXT
+    title.Text = titleText or "List"
+    title.Parent = row
+
+    --------------------------------------------------
+    -- CONTAINER LIST
+    --------------------------------------------------
+    local container = Instance.new("Frame")
+    container.Name = "ListContainer"
+    container.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
+    container.Position = UDim2.new(0, 0, 0, 20)
+    container.Size = UDim2.new(1, 0, 0, 0)
+    container.AutomaticSize = Enum.AutomaticSize.Y
+    container.Parent = row
+
+    createCorner(container, 6)
+    createStroke(container, Color3.fromRGB(40, 40, 40), 1, 0.5)
+
+    local pad = Instance.new("UIPadding")
+    pad.PaddingTop    = UDim.new(0, 4)
+    pad.PaddingBottom = UDim.new(0, 4)
+    pad.PaddingLeft   = UDim.new(0, 4)
+    pad.PaddingRight  = UDim.new(0, 4)
+    pad.Parent = container
+
+    local layout = Instance.new("UIListLayout")
+    layout.FillDirection = Enum.FillDirection.Vertical
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 2)
+    layout.Parent = container
+
+    --------------------------------------------------
+    -- STATE INTERNAL
+    --------------------------------------------------
+    local selectedMap    = {}           -- [key] = true/false
+    local currentEntries = entries      -- list aktif sekarang
+
+    local function normalizeEntry(e)
+        if type(e) == "table" then
+            return e.key or e.name, e.name or tostring(e.key)
+        else
+            return e, tostring(e)
+        end
+    end
+
+    --------------------------------------------------
+    -- BUILD BUTTONS
+    --------------------------------------------------
+    local function buildButtons(listOpt)
+        -- kalau dipanggil dengan list baru â†’ update currentEntries
+        if listOpt then
+            currentEntries = listOpt
+        end
+
+        local list = currentEntries or {}
+
+        -- clear lama
+        for _, child in ipairs(container:GetChildren()) do
+            if child:IsA("TextButton") then
+                child:Destroy()
+            end
+        end
+
+        for i, e in ipairs(list) do
+            local key, labelText = normalizeEntry(e)
+
+            -- kalau belum ada state, lihat dari field entry (selected / on)
+            if selectedMap[key] == nil then
+                if type(e) == "table" and (e.selected or e.on) then
+                    selectedMap[key] = true
+                else
+                    selectedMap[key] = false
+                end
+            end
+
+            local btn = Instance.new("TextButton")
+            btn.Name = "Item_" .. tostring(key)
+            btn.AutoButtonColor = false
+            btn.BackgroundColor3 = Color3.fromRGB(22, 22, 22)
+            btn.Size = UDim2.new(1, 0, 0, 22)
+            btn.Text = "  " .. labelText
+            btn.Font = Enum.Font.Gotham
+            btn.TextXAlignment = Enum.TextXAlignment.Left
+            btn.TextSize = 12
+            btn.TextColor3 = Color3.fromRGB(200, 200, 200)
+            btn.LayoutOrder = i
+            btn.Parent = container
+            createCorner(btn, 4)
+
+            local function applyVisual()
+                if selectedMap[key] then
+                    tweenColor(btn, "BackgroundColor3", COLOR_YELLOW)
+                    btn.TextColor3 = Color3.fromRGB(0, 0, 0)
+                else
+                    tweenColor(btn, "BackgroundColor3", Color3.fromRGB(22, 22, 22))
+                    btn.TextColor3 = Color3.fromRGB(200, 200, 200)
+                end
+            end
+            applyVisual()
+
+            btn.MouseButton1Click:Connect(function()
+                selectedMap[key] = not selectedMap[key]
+                applyVisual()
+                onItemToggle(key, selectedMap[key], labelText)
+            end)
+        end
+    end
+
+    -- build pertama
+    buildButtons(currentEntries)
+
+    --------------------------------------------------
+    -- API
+    --------------------------------------------------
+    local function api(action, payload)
+        if action == "setList" or action == "setItems" then
+            -- ganti isi list + rebuild
+            buildButtons(payload or {})
+
+        elseif action == "setSelected" and type(payload) == "table" then
+            -- ganti state selectedMap sesuai payload
+            selectedMap = {}
+            for k, v in pairs(payload) do
+                if v then
+                    selectedMap[k] = true
+                end
+            end
+            -- redraw pakai currentEntries
+            buildButtons()
+
+        elseif action == "getSelected" then
+            local result = {}
+            for k, v in pairs(selectedMap) do
+                if v then
+                    table.insert(result, k)
+                end
+            end
+            return result
+        end
+    end
+
+    return row, api
+end
+
+
+
+----------------------------------------------------------
+-- ROW: DROPDOWN (single / multi) dgn overlay + search
+----------------------------------------------------------
+-- opts:
+-- {
+--   label       = "Target Player",
+--   placeholder = "Select...",
+--   mode        = "single" / "multi"  (default: "single")
+--   getItems    = function() return { "A", "B" } end
+--                -- ATAU langsung table: { "A","B" } / { {key="a",name="A"}, ... }
+--   initial     =   -- SINGLE: "key" / "name"
+--                 -- MULTI : { [key]=true, [key2]=true }
+--   onChanged   = function(mode, selected) end
+-- }
+function MainUI:CreateRowDropdown(parent, opts)
+    opts = opts or {}
+    local mode        = (opts.mode == "multi") and "multi" or "single"
+    local labelText   = opts.label or "Dropdown"
+    local placeholder = opts.placeholder or "Select..."
+
+    -- Sumber item bisa function atau table
+    local itemsSource = opts.getItems or {}
+
+    local function getItemsList()
+        if type(itemsSource) == "function" then
+            local ok, res = pcall(itemsSource)
+            if ok and type(res) == "table" then
+                return res
+            else
+                warn("[NodeHubDropdown] getItems() tidak mengembalikan table, pakai {}")
+                return {}
+            end
+        elseif type(itemsSource) == "table" then
+            return itemsSource
+        else
+            warn("[NodeHubDropdown] getItems bukan function/table, pakai {}")
+            return {}
+        end
+    end
+
+    local onChanged   = opts.onChanged
+
+    -- state
+    local currentItems = {}
+    local keyToLabel   = {}
+
+    local selectedKey  = nil
+    local selectedMap  = {}
+
+    if mode == "single" then
+        if opts.initial ~= nil then
+            selectedKey = tostring(opts.initial)
+        end
+    else
+        if type(opts.initial) == "table" then
+            for k, v in pairs(opts.initial) do
+                if v then
+                    selectedMap[tostring(k)] = true
+                end
+            end
+        end
+    end
+
+    ------------------------------------------------------
+    -- ROW + LABEL + BUTTON
+    ------------------------------------------------------
+    local row = Instance.new("Frame")
+    row.Name = "RowDropdown"
+    row.BackgroundTransparency = 1
+    row.Size = UDim2.new(1, 0, 0, 34)
+    row.LayoutOrder = #parent:GetChildren() + 1
+    row.Parent = parent
+
+    local label = Instance.new("TextLabel")
+    label.Name = "Label"
+    label.BackgroundTransparency = 1
+    label.Position = UDim2.new(0, 0, 0, 0)
+    label.Size = UDim2.new(0.6, 0, 1, 0)
+    label.Font = Enum.Font.Gotham
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextSize = 12
+    label.TextColor3 = COLOR_GRAY_TEXT
+    label.Text = labelText
+    label.Parent = row
+
+    local button = Instance.new("TextButton")
+    button.Name = "DropdownButton"
+    button.AutoButtonColor = false
+    button.BackgroundColor3 = Color3.fromRGB(18,18,18)
+    button.Size = UDim2.new(0.4, 0, 1, -8)
+    button.Position = UDim2.new(0.60, 0, 0, 3)
+    button.Font = Enum.Font.Gotham
+    button.TextXAlignment = Enum.TextXAlignment.Center
+    button.TextSize = 11
+    button.TextColor3 = Color3.fromRGB(230,230,230)
+    button.Text = "  " .. placeholder
+    button.Parent = row
+    createCorner(button, 6)
+    createStroke(button, Color3.fromRGB(60,60,60), 1, 0.6)
+
+    local arrow = Instance.new("TextLabel")
+    arrow.Name = "Arrow"
+    arrow.BackgroundTransparency = 1
+    arrow.Size = UDim2.new(0, 16, 1, 0)
+    arrow.Position = UDim2.new(1, -18, 0, 0)
+    arrow.Font = Enum.Font.GothamBold
+    arrow.TextSize = 12
+    arrow.TextXAlignment = Enum.TextXAlignment.Center
+    arrow.TextColor3 = Color3.fromRGB(200,200,200)
+    arrow.Text = "â–¼"
+    arrow.Parent = button
+
+    local function normalizeItem(e)
+        if type(e) == "table" then
+            local key = e.key or e.name
+            local lbl = e.name or tostring(e.key)
+            key = tostring(key)
+            return key, lbl
+        else
+            local key = tostring(e)
+            return key, key
+        end
+    end
+
+    local function refreshButtonText()
+        if mode == "single" then
+            if not selectedKey then
+                button.Text = "  " .. placeholder
+                return
+            end
+            local label = keyToLabel[selectedKey] or selectedKey
+            button.Text = "  " .. label
+            return
+        end
+
+        local names = {}
+        for k, on in pairs(selectedMap) do
+            if on then
+                table.insert(names, keyToLabel[k] or k)
+            end
+        end
+        table.sort(names)
+
+        if #names == 0 then
+            button.Text = "  " .. placeholder
+            return
+        end
+
+        local maxChars = 25
+        local total = table.concat(names, ", ")
+        if #total <= maxChars then
+            button.Text = "  " .. total
+            return
+        end
+
+        local shown, used = {}, 0
+        for i, name in ipairs(names) do
+            local part = (i == 1) and name or (", " .. name)
+            if used + #part > maxChars then break end
+            table.insert(shown, name)
+            used += #part
+        end
+        local rest = #names - #shown
+        local txt = table.concat(shown, ", ")
+        if rest > 0 then
+            txt ..= (" +%d"):format(rest)
+        end
+        button.Text = "  " .. txt
+    end
+
+local function openDropdown()
+    -- parent: panel kanan / main frame NodeHub
+    local parentFrame = self.right or self.mainFrame
+
+    --------------------------------------------------
+    -- OVERLAY DI DALAM NODEHUB (BLOCK CLICK DI BAWAH)
+    --------------------------------------------------
+    local overlay = Instance.new("TextButton")
+    overlay.Name = "NodeHubDropdownOverlay"
+    overlay.BackgroundColor3 = Color3.fromRGB(0,0,0)
+    overlay.BackgroundTransparency = 0.25      -- agak gelap
+    overlay.AutoButtonColor = false
+    overlay.BorderSizePixel = 0
+    overlay.Text = ""
+    overlay.Size = UDim2.new(1, 0, 1, 0)
+    overlay.Position = UDim2.new(0, 0, 0, 0)
+    overlay.ZIndex = 98
+    overlay.Active = true
+    overlay.Parent = parentFrame
+
+    --------------------------------------------------
+    -- PANEL DROPDOWN (TENGAH NODEHUB)
+    --------------------------------------------------
+    local panel = Instance.new("Frame")
+    panel.Name = "DropdownPanel"
+    panel.Size = UDim2.new(0, 280, 0, 260)
+    panel.AnchorPoint = Vector2.new(0.5, 0.5)
+    panel.Position = UDim2.new(0.5, 0, 0.5, 0)
+    panel.BackgroundColor3 = COLOR_PANEL
+    panel.ZIndex = 99                 -- di atas overlay
+    panel.Active = true
+    panel.Parent = overlay
+    createCorner(panel, 10)
+    createStroke(panel, COLOR_YELLOW, 1, 0.3)
+
+    local pad = Instance.new("UIPadding")
+    pad.PaddingTop    = UDim.new(0, 8)
+    pad.PaddingBottom = UDim.new(0, 8)
+    pad.PaddingLeft   = UDim.new(0, 8)
+    pad.PaddingRight  = UDim.new(0, 8)
+    pad.Parent = panel
+
+    --------------------------------------------------
+    -- HEADER: LABEL (KIRI) + TOMBOL X (KANAN)
+    --------------------------------------------------
+    local header = Instance.new("Frame")
+    header.Name = "Header"
+    header.BackgroundTransparency = 1
+    header.Size = UDim2.new(1, 0, 0, 24)
+    header.Position = UDim2.new(0, 0, 0, 0)
+    header.ZIndex = 100
+    header.Parent = panel
+
+    local headerLabel = Instance.new("TextLabel")
+    headerLabel.Name = "HeaderLabel"
+    headerLabel.BackgroundTransparency = 1
+    headerLabel.Size = UDim2.new(1, -28, 1, 0) -- sisakan space untuk X
+    headerLabel.Position = UDim2.new(0, 0, 0, 0)
+    headerLabel.Font = Enum.Font.Gotham
+    headerLabel.TextSize = 12
+    headerLabel.TextXAlignment = Enum.TextXAlignment.Left
+    headerLabel.TextColor3 = COLOR_GRAY_TEXT
+    headerLabel.Text = labelText   -- pakai label dari row
+    headerLabel.ZIndex = 101
+    headerLabel.Parent = header
+
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Name = "CloseButton"
+    closeBtn.Size = UDim2.new(0, 22, 0, 22)
+    closeBtn.AnchorPoint = Vector2.new(1, 0.5)
+    closeBtn.Position = UDim2.new(1, 0, 0.5, 0)
+    closeBtn.BackgroundColor3 = Color3.fromRGB(18,18,18)
+    closeBtn.AutoButtonColor = false
+    closeBtn.BorderSizePixel = 0
+    closeBtn.Text = "X"
+    closeBtn.Font = Enum.Font.GothamBold
+    closeBtn.TextSize = 12
+    closeBtn.TextColor3 = COLOR_WHITE
+    closeBtn.ZIndex = 101
+    closeBtn.Parent = header
+    createCorner(closeBtn, 6)
+    createStroke(closeBtn, COLOR_YELLOW, 1, 0.4)
+
+    --------------------------------------------------
+    -- SEARCH (DI BAWAH HEADER, FULL WIDTH)
+    --------------------------------------------------
+    local search = Instance.new("TextBox")
+    search.Name = "SearchBox"
+    search.Size = UDim2.new(1, 0, 0, 24)
+    -- 24 (header) + 4 margin = 28
+    search.Position = UDim2.new(0, 0, 0, 28)
+    search.BackgroundColor3 = Color3.fromRGB(18,18,18)
+    search.PlaceholderText = "Search..."
+    search.ClearTextOnFocus = false
+    search.Font = Enum.Font.Gotham
+    search.TextSize = 12
+    search.TextXAlignment = Enum.TextXAlignment.Center
+    search.TextColor3 = Color3.fromRGB(230,230,230)
+    search.ZIndex = 100
+    search.Parent = panel
+    createCorner(search, 6)
+    createStroke(search, Color3.fromRGB(60,60,60), 1, 0.6)
+
+    --------------------------------------------------
+    -- LIST (DI BAWAH SEARCH)
+    --------------------------------------------------
+    -- total tinggi header+margin+search+margin = 24 + 4 + 24 + 8 = 60
+    local listTopOffset = 60
+
+    local list = Instance.new("ScrollingFrame")
+    list.Name = "List"
+    list.Size = UDim2.new(1, 0, 1, -listTopOffset)
+    list.Position = UDim2.new(0, 0, 0, listTopOffset)
+    list.BackgroundTransparency = 1
+    list.ScrollBarThickness = 4
+    list.ScrollBarImageTransparency = 0
+    list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    list.CanvasSize = UDim2.new(0, 0, 0, 0)
+    list.ZIndex = 100
+    list.Parent = panel
+
+    local layout = Instance.new("UIListLayout")
+    layout.FillDirection = Enum.FillDirection.Vertical
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 3)
+    layout.Parent = list
+
+    --------------------------------------------------
+    -- REBUILD LIST (SAMA KAYAK KODEMU SEBELUMNYA)
+    --------------------------------------------------
+local function rebuildList()
+    currentItems = {}
+    keyToLabel   = {}
+
+    -- build items + label map
+    local rawItems = getItemsList() or {}
+    for _, e in ipairs(rawItems) do
+        local k, lbl = normalizeItem(e)
+        table.insert(currentItems, { key = k, label = lbl })
+        keyToLabel[k] = lbl
+    end
+
+    -- clear old list children (buttons/labels/frames)
+    for _, c in ipairs(list:GetChildren()) do
+        if not c:IsA("UIListLayout") and not c:IsA("UIPadding") then
+            c:Destroy()
+        end
+    end
+
+    local q = (search.Text or ""):lower()
+
+    -- helper: check selected
+    local function isSelected(k)
+        if mode == "single" then
+            return selectedKey == k
+        else
+            return selectedMap[k] == true
+        end
+    end
+
+    -- filter + split selected/rest
+    local picked, rest = {}, {}
+    for _, info in ipairs(currentItems) do
+        local lbl = tostring(info.label or "")
+        local low = lbl:lower()
+        if q == "" or low:find(q, 1, true) then
+            if isSelected(info.key) then
+                table.insert(picked, info)
+            else
+                table.insert(rest, info)
+            end
+        end
+    end
+
+    -- optional: sort per group biar rapi
+    local function byLabel(a, b)
+        return tostring(a.label):lower() < tostring(b.label):lower()
+    end
+    table.sort(picked, byLabel)
+    table.sort(rest, byLabel)
+
+    -- merge: selected dulu
+    local ordered = {}
+    for _, v in ipairs(picked) do table.insert(ordered, v) end
+    for _, v in ipairs(rest)   do table.insert(ordered, v) end
+
+    local idx = 0
+
+    -- render
+    for _, info in ipairs(ordered) do
+        local k   = info.key
+        local lbl = info.label
+
+        idx += 1
+
+        local btnItem = Instance.new("TextButton")
+        btnItem.Name = "Item_" .. tostring(k)
+        btnItem.AutoButtonColor = false
+        btnItem.BackgroundColor3 = Color3.fromRGB(22,22,22)
+        btnItem.Size = UDim2.new(1, 0, 0, 22)
+        btnItem.Text = "  " .. tostring(lbl)
+        btnItem.Font = Enum.Font.Gotham
+        btnItem.TextXAlignment = Enum.TextXAlignment.Center
+        btnItem.TextSize = 12
+        btnItem.TextColor3 = Color3.fromRGB(220,220,220)
+        btnItem.LayoutOrder = idx
+        btnItem.ZIndex = 101
+        btnItem.Parent = list
+        createCorner(btnItem, 4)
+
+        local function applyVisual()
+            if mode == "single" then
+                if selectedKey == k then
+                    tweenColor(btnItem, "BackgroundColor3", COLOR_YELLOW)
+                    btnItem.TextColor3 = COLOR_PANEL
+                else
+                    tweenColor(btnItem, "BackgroundColor3", Color3.fromRGB(22,22,22))
+                    btnItem.TextColor3 = Color3.fromRGB(220,220,220)
+                end
+            else
+                if selectedMap[k] then
+                    tweenColor(btnItem, "BackgroundColor3", COLOR_YELLOW)
+                    btnItem.TextColor3 = COLOR_PANEL
+                else
+                    tweenColor(btnItem, "BackgroundColor3", Color3.fromRGB(22,22,22))
+                    btnItem.TextColor3 = Color3.fromRGB(220,220,220)
+                end
+            end
+        end
+        applyVisual()
+
+        btnItem.MouseButton1Click:Connect(function()
+            if mode == "single" then
+                selectedKey = k
+                refreshButtonText()
+                if onChanged then
+                    onChanged("single", selectedKey)
+                end
+                overlay:Destroy()
+            else
+                selectedMap[k] = not selectedMap[k]
+                refreshButtonText()
+                if onChanged then
+                    local copy = {}
+                    for kk, vv in pairs(selectedMap) do
+                        copy[kk] = vv and true or false
+                    end
+                    onChanged("multi", copy)
+                end
+
+                -- biar langsung â€œnaik ke atasâ€ setelah dipilih/dilepas
+                rebuildList()
+                return
+            end
+
+            -- single: juga rebuild biar highlight konsisten (optional)
+            -- rebuildList()
+        end)
+    end
+end
+
+
+    search:GetPropertyChangedSignal("Text"):Connect(rebuildList)
+
+    --------------------------------------------------
+    -- CLOSE HANDLER (X & KLIK DI LUAR PANEL)
+    --------------------------------------------------
+    local UserInputService = game:GetService("UserInputService")
+
+    local function closeOverlay()
+        if overlay and overlay.Parent then
+            overlay:Destroy()
+        end
+    end
+
+    closeBtn.MouseButton1Click:Connect(closeOverlay)
+
+    overlay.MouseButton1Click:Connect(function()
+        local mousePos = UserInputService:GetMouseLocation()
+        local pPos = panel.AbsolutePosition
+        local pSize = panel.AbsoluteSize
+
+        local x, y = mousePos.X, mousePos.Y
+        local insideX = x >= pPos.X and x <= pPos.X + pSize.X
+        local insideY = y >= pPos.Y and y <= pPos.Y + pSize.Y
+
+        -- kalau klik di LUAR panel â†’ close, kalau di dalam panel â†’ abaikan
+        if not (insideX and insideY) then
+            closeOverlay()
+        end
+    end)
+
+    search.Text = ""
+    rebuildList()
+end
+
+
+
+
+    button.MouseEnter:Connect(function()
+        tweenColor(button, "BackgroundColor3", Color3.fromRGB(24,24,24))
+    end)
+    button.MouseLeave:Connect(function()
+        tweenColor(button, "BackgroundColor3", Color3.fromRGB(18,18,18))
+    end)
+    button.MouseButton1Click:Connect(openDropdown)
+
+    refreshButtonText()
+
+    local api = {}
+
+    function api.getMode()
+        return mode
+    end
+
+    function api.setMode(newMode)
+        if newMode == "multi" then
+            mode = "multi"
+        else
+            mode = "single"
+        end
+        refreshButtonText()
+    end
+
+    function api.setSelected(value)
+        if mode == "single" then
+            selectedKey = value and tostring(value) or nil
+        else
+            selectedMap = {}
+            if type(value) == "table" then
+                for k, v in pairs(value) do
+                    if v then
+                        selectedMap[tostring(k)] = true
+                    end
+                end
+            end
+        end
+        refreshButtonText()
+    end
+
+    function api.getSelected()
+        if mode == "single" then
+            return selectedKey
+        else
+            local copy = {}
+            for k, v in pairs(selectedMap) do
+                if v then copy[k] = true end
+            end
+            return copy
+        end
+    end
+
+    function api.refreshLabel()
+        refreshButtonText()
+    end
+
+    return row, api
+end
+
+function MainUI:OpenModePicker(items, currentId, onChosen)
+    -- items: { {id="auto", label="AUTO - ..."}, ... }
+    -- currentId: string (misal "auto")
+    -- onChosen(id): callback
+
+    -- ROOT GUI (bukan cuma panel kanan)
+
+
+    local parentGui = self._sg or PlayerGui   -- â¬…ï¸ ScreenGui
+    local parentFrame = parentGui             -- â¬…ï¸ pakai ini, bukan self.right
+
+    --------------------------------------------------
+    -- OVERLAY DI DALAM ROOT UI
+    --------------------------------------------------
+    local overlay = Instance.new("TextButton")
+    overlay.Name = "NodeHubModeOverlay"
+    overlay.BackgroundColor3 = Color3.fromRGB(0,0,0)
+    overlay.BackgroundTransparency = 0.25
+    overlay.AutoButtonColor = false
+    overlay.BorderSizePixel = 0
+    overlay.Text = ""
+    overlay.Size = UDim2.new(1, 0, 1, 0)         -- full screen
+    overlay.Position = UDim2.new(0, 0, 0, 0)
+    overlay.ZIndex = 98
+    overlay.Active = true
+    overlay.Parent = parentGui     
+
+    --------------------------------------------------
+    -- PANEL TENGAH
+    --------------------------------------------------
+    local panel = Instance.new("Frame")
+    panel.Name = "ModePanel"
+    panel.Size = UDim2.new(0, 300, 0, 260) -- lebar default, nanti diubah
+    panel.AnchorPoint = Vector2.new(0.5, 0.5)
+    panel.Position = UDim2.new(0.5, 0, 0.5, 0)
+    panel.BackgroundColor3 = COLOR_PANEL
+    panel.ZIndex = 99
+    panel.Active = true
+    panel.Parent = overlay
+    createCorner(panel, 10)
+    createStroke(panel, COLOR_YELLOW, 1, 0.3)
+
+    local pad = Instance.new("UIPadding")
+    pad.PaddingTop    = UDim.new(0, 8)
+    pad.PaddingBottom = UDim.new(0, 8)
+    pad.PaddingLeft   = UDim.new(0, 8)
+    pad.PaddingRight  = UDim.new(0, 8)
+    pad.Parent = panel
+
+    --------------------------------------------------
+    -- CLOSE BUTTON
+    --------------------------------------------------
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Size = UDim2.new(0, 22, 0, 22)
+    closeBtn.AnchorPoint = Vector2.new(1, 0)
+    closeBtn.Position = UDim2.new(1, 2, 0, 0)
+    closeBtn.BackgroundColor3 = Color3.fromRGB(18,18,18)
+    closeBtn.AutoButtonColor = false
+    closeBtn.BorderSizePixel = 0
+    closeBtn.Text = "X"
+    closeBtn.Font = Enum.Font.GothamBold
+    closeBtn.TextSize = 12
+    closeBtn.TextColor3 = COLOR_WHITE
+    closeBtn.ZIndex = 101
+    closeBtn.Parent = panel
+    createCorner(closeBtn, 6)
+    createStroke(closeBtn, COLOR_YELLOW, 1, 0.4)
+
+    --------------------------------------------------
+    -- TITLE + SEARCH
+    --------------------------------------------------
+    local title = Instance.new("TextLabel")
+    title.BackgroundTransparency = 1
+    title.Size = UDim2.new(1, -24, 0, 20)
+    title.Position = UDim2.new(0, 0, 0, 0)
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 13
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.TextColor3 = COLOR_YELLOW
+    title.Text = "Select Auto KG Stage Mode"
+    title.ZIndex = 100
+    title.Parent = panel
+
+    local search = Instance.new("TextBox")
+    search.Name = "SearchBox"
+    search.Size = UDim2.new(1, 0, 0, 24)
+    search.Position = UDim2.new(0, 0, 0, 24)
+    search.BackgroundColor3 = Color3.fromRGB(18,18,18)
+    search.PlaceholderText = "Search..."
+    search.ClearTextOnFocus = false
+    search.Font = Enum.Font.Gotham
+    search.TextSize = 12
+    search.TextXAlignment = Enum.TextXAlignment.Center
+    search.TextColor3 = Color3.fromRGB(230,230,230)
+    search.ZIndex = 100
+    search.Parent = panel
+    createCorner(search, 6)
+    createStroke(search, Color3.fromRGB(60,60,60), 1, 0.6)
+
+    --------------------------------------------------
+    -- LIST
+    --------------------------------------------------
+    local list = Instance.new("ScrollingFrame")
+    list.Name = "List"
+    list.Size = UDim2.new(1, 0, 1, -56)
+    list.Position = UDim2.new(0, 0, 0, 52)
+    list.BackgroundTransparency = 1
+    list.ScrollBarThickness = 4
+    list.ScrollBarImageTransparency = 0
+    list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    list.CanvasSize = UDim2.new(0, 0, 0, 0)
+    list.ZIndex = 100
+    list.Parent = panel
+
+    local layout = Instance.new("UIListLayout")
+    layout.FillDirection = Enum.FillDirection.Vertical
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 3)
+    layout.Parent = list
+
+    --------------------------------------------------
+    -- CLOSE HANDLER
+    --------------------------------------------------
+    local function closeOverlay()
+        if overlay and overlay.Parent then
+            overlay:Destroy()
+        end
+    end
+
+    closeBtn.MouseButton1Click:Connect(closeOverlay)
+
+    local UIS = game:GetService("UserInputService")
+    overlay.MouseButton1Click:Connect(function()
+        local mp   = UIS:GetMouseLocation()
+        local pPos = panel.AbsolutePosition
+        local pSz  = panel.AbsoluteSize
+
+        local insideX = mp.X >= pPos.X and mp.X <= pPos.X + pSz.X
+        local insideY = mp.Y >= pPos.Y and mp.Y <= pPos.Y + pSz.Y
+        if not (insideX and insideY) then
+            closeOverlay()
+        end
+    end)
+
+    --------------------------------------------------
+    -- HITUNG LEBAR PANEL DARI TEKS TERPANJANG
+    --------------------------------------------------
+    --------------------------------------------------
+-- HITUNG LEBAR PANEL DARI TEKS TERPANJANG
+--------------------------------------------------
+local function resizePanelWidthFromItems()
+    if not TextService or not TextService.GetTextSize then
+        panel.Size = UDim2.new(0, 300, 0, 260)
+        return
+    end
+
+    local maxWidth  = 0
+    local font      = Enum.Font.Gotham
+    local textSize  = 11
+
+    for _, opt in ipairs(items or {}) do
+        local id   = tostring(opt.id)
+        local text = opt.label or id
+        local full = string.format("  [%s]  %s", id, text)
+
+        local bounds = TextService:GetTextSize(
+            full,
+            textSize,
+            font,
+            Vector2.new(10000, 24)
+        )
+
+        if bounds.X > maxWidth then
+            maxWidth = bounds.X
+        end
+    end
+
+    -- hitung padding kiri/kanan dari UIPadding panel
+    local padLeft  = pad and pad.PaddingLeft and pad.PaddingLeft.Offset or 0
+    local padRight = pad and pad.PaddingRight and pad.PaddingRight.Offset or 0
+
+    -- sedikit margin ekstra di kiri/kanan button
+    local extraMargin = 15
+
+    local desiredWidth = maxWidth + padLeft + padRight + extraMargin
+
+    -- MIN & MAX LEBAR PANEL
+    desiredWidth = math.clamp(desiredWidth, 340, 680)
+
+    -- tinggi tetap 260
+    panel.Size = UDim2.new(0, desiredWidth, 0, 290)
+end
+
+
+    resizePanelWidthFromItems()
+
+    --------------------------------------------------
+    -- REBUILD LIST
+    --------------------------------------------------
+    local function rebuildList()
+        for _, c in ipairs(list:GetChildren()) do
+            if c:IsA("TextButton") then
+                c:Destroy()
+            end
+        end
+
+        local q   = string.lower(search.Text or "")
+        local idx = 0
+        local cur = tostring(currentId or "")
+
+        for _, opt in ipairs(items or {}) do
+            local id   = tostring(opt.id)
+            local text = opt.label or id
+            local low  = string.lower(text)
+
+            if q == "" or string.find(low, q, 1, true) then
+                idx += 1
+
+                local btn = Instance.new("TextButton")
+                btn.Name = "Item_" .. id
+                btn.AutoButtonColor = false
+                btn.BackgroundColor3 = (id == cur)
+                    and COLOR_YELLOW
+                    or Color3.fromRGB(22,22,22)
+
+                btn.Size = UDim2.new(1, 0, 0, 24)
+                btn.Text = string.format("  %s", text)
+                btn.Font = Enum.Font.Gotham
+                btn.TextXAlignment = Enum.TextXAlignment.Left
+                btn.TextSize = 12
+                btn.TextColor3 = (id == cur)
+                    and COLOR_PANEL
+                    or Color3.fromRGB(220,220,220)
+                btn.LayoutOrder = idx
+                btn.ZIndex = 101
+
+                -- jangan di-"..." (biar full, panel sudah dilebarkan)
+                btn.TextTruncate = Enum.TextTruncate.None
+
+                btn.Parent = list
+                createCorner(btn, 4)
+
+                btn.MouseButton1Click:Connect(function()
+                    currentId = id
+                    if onChosen then
+                        onChosen(id)
+                    end
+                    closeOverlay()
+                end)
+            end
+        end
+    end
+
+    search:GetPropertyChangedSignal("Text"):Connect(rebuildList)
+    search.Text = ""
+    rebuildList()
+end
+
+
+-- ======================
+-- API: FOOTER BUTTONS
+-- ======================
+-- list: {
+--   { text="START", kind="primary"/"danger"/"normal", order=1, onClick=function() end },
+--   ...
+-- }
+-- RENDER FOOTER DARI LIST
+-- ======================
+-- API: FOOTER BUTTONS
+-- ======================
+-- list: {
+--   { text="START", kind="primary"/"danger"/"normal", order=1, onClick=function() end },
+--   ...
+-- }
+local TweenService = game:GetService("TweenService")
+local RunService   = game:GetService("RunService")
+
+local RUN_STROKE_NAME = "__RUN_ELECTRIC_STROKE"
+local RUN_GRAD_NAME   = "__RUN_ELECTRIC_GRAD"
+local RUN_TOKEN_ATTR  = "__RUN_ELECTRIC_TOKEN"
+
+function MainUI:_applyRunningStyle(btn, isRunning)
+    if not (btn and btn:IsA("GuiObject")) then return end
+
+    -- STOP: cleanup
+    if not isRunning then
+        btn:SetAttribute(RUN_TOKEN_ATTR, nil)
+        local st = btn:FindFirstChild(RUN_STROKE_NAME)
+        if st then st:Destroy() end
+        return
+    end
+
+    -- ensure stroke
+    local st = btn:FindFirstChild(RUN_STROKE_NAME)
+    if not st then
+        st = Instance.new("UIStroke")
+        st.Name = RUN_STROKE_NAME
+        st.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        st.Thickness = 2
+        st.Transparency = 0.08
+        st.Color = Color3.fromRGB(255, 217, 0) -- kuning NodeHub
+        st.Parent = btn
+    end
+
+    -- ensure gradient (kilat)
+    local grad = st:FindFirstChild(RUN_GRAD_NAME)
+    if not grad then
+        grad = Instance.new("UIGradient")
+        grad.Name = RUN_GRAD_NAME
+        grad.Rotation = 0
+        grad.Parent = st
+
+        -- Pola "electric": gelap â†’ terang â†’ putih â†’ terang â†’ gelap
+        grad.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0.00, Color3.fromRGB(120, 90, 0)),
+            ColorSequenceKeypoint.new(0.40, Color3.fromRGB(255, 217, 0)),
+            ColorSequenceKeypoint.new(0.50, Color3.fromRGB(255, 255, 230)),
+            ColorSequenceKeypoint.new(0.60, Color3.fromRGB(255, 217, 0)),
+            ColorSequenceKeypoint.new(1.00, Color3.fromRGB(120, 90, 0)),
+        })
+    end
+
+    -- anti double-loop: token unik
+    local token = tostring(os.clock()) .. "_" .. tostring(math.random(1, 1e9))
+    btn:SetAttribute(RUN_TOKEN_ATTR, token)
+
+    -- Gerak listrik: rotation cepat + jitter + flicker
+    task.spawn(function()
+        local baseThickness = 1
+        local baseTrans     = 0.08
+        local rot = 0
+
+        while btn.Parent and btn:GetAttribute(RUN_TOKEN_ATTR) == token do
+            -- rotasi cepat (arus berjalan)
+            rot = (rot + 35 + math.random(-6, 6)) % 360
+            grad.Rotation = rot
+
+            -- jitter kilat: kadang loncat lebih cepat
+            if math.random() < 0.18 then
+                grad.Rotation = (grad.Rotation + math.random(40, 120)) % 360
+            end
+
+            -- flicker transparency (kedip halus)
+            if math.random() < 0.22 then
+                st.Transparency = math.clamp(baseTrans + (math.random() * 0.20), 0, 0.35)
+            else
+                st.Transparency = baseTrans
+            end
+
+            -- â€œsnapâ€ ketebalan kayak setrum
+            if math.random() < 0.16 then
+                st.Thickness = baseThickness + 1
+            else
+                st.Thickness = baseThickness
+            end
+
+            task.wait(0.1 + math.random() * 0.02) -- cepat = listrik
+        end
+    end)
+end
+
+function MainUI:_startFooterRunningWatcher()
+    if self.__footerRunWatcherStarted then return end
+    self.__footerRunWatcherStarted = true
+
+    task.spawn(function()
+        local last = nil
+        while self and self.mainFrame and self.mainFrame.Parent do
+            local loop = rawget(_G, "AutoKGLoop")
+            local running = false
+            if loop and type(loop.IsRunning) == "function" then
+                local ok, v = pcall(loop.IsRunning)
+                running = (ok and v == true) or false
+            end
+
+            if running ~= last then
+                last = running
+
+                -- tombol start (pakai key yang konsisten)
+                local btn = self.footerButtons and (self.footerButtons["START"] or self.footerButtons["Start"])
+                if btn then
+                    self:_applyRunningStyle(btn, running)
+                    -- optional: ubah teks juga
+                    btn.Text = running and "RUNNING" or "START"
+                end
+            end
+
+            task.wait(0.25)
+        end
+    end)
+end
+
+
+
+function MainUI:_renderFooter(list)
+    -- bersihkan footer lama
+    for _, child in ipairs(self.footer:GetChildren()) do
+        if child:IsA("TextButton") then
+            child:Destroy()
+        end
+    end
+    self.footerButtons = {}
+
+    -- cek apakah ada tombol footer?
+    local hasButtons = (type(list) == "table" and #list > 0)
+
+    -- kalau TIDAK ADA tombol â†’ sembunyikan footer & panjangkan content
+    if not hasButtons then
+        -- hide footer bar
+        if self.footer then
+            self.footer.Visible = false
+        end
+
+        -- panjangkan content sampai bawah (pakai preset no-footer kalau ada)
+        if self._contentSizeNoFooter then
+            self.content.Size = self._contentSizeNoFooter
+        end
+
+        return
+    end
+
+    -- kalau ADA tombol â†’ footer kelihatan & content pakai size normal
+    if self.footer then
+        self.footer.Visible = true
+    end
+    if self._contentSizeWithFooter then
+        self.content.Size = self._contentSizeWithFooter
+    end
+
+    --------------------------------------------------
+    -- render tombol seperti biasa
+    --------------------------------------------------
+    for idx, def in ipairs(list) do
+        local kind = def.kind or "normal"
+        local text = def.text or ("Btn" .. idx)
+
+        local bgColor  = COLOR_PANEL
+        local txtColor = COLOR_WHITE
+        local strokeT  = 1
+        local strokeTr = 0.4
+        local width    = 80
+
+        if kind == "primary" then
+            bgColor  = COLOR_YELLOW
+            txtColor = COLOR_PANEL
+            strokeT  = 2
+            strokeTr = 0.1
+            width    = 120
+        elseif kind == "danger" then
+            bgColor  = Color3.fromRGB(80, 0, 0)
+            txtColor = COLOR_WHITE
+            strokeT  = 2
+            strokeTr = 0.1
+            width    = 90
+        end
+
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(0, width, 1, 0)
+        btn.AutoButtonColor = false
+        btn.BackgroundColor3 = bgColor
+        btn.Text = text
+        btn.TextSize = 12
+        btn.Font = Enum.Font.GothamBold
+        btn.TextColor3 = txtColor
+        btn.LayoutOrder = def.order or idx
+        btn.Parent = self.footer
+        -- apply running style kalau def.running true
+self:_applyRunningStyle(btn, def.running == true)
+
+        createCorner(btn, 999)
+        createStroke(btn, COLOR_YELLOW, strokeT, strokeTr)
+
+        if def.onClick then
+            btn.MouseButton1Click:Connect(def.onClick)
+        end
+
+        local key = def.key or text
+self.footerButtons[key] = btn
+
+        
+        if def.onReady then
+            pcall(def.onReady, btn)
+        end
+        self:_startFooterRunningWatcher()
+
+    end
+end
+
+
+-- DEFAULT FOOTER (berlaku global jika tidak ada override per-tab)
+function MainUI:SetFooterButtons(list)
+    self.footerConfig.default = list
+    -- kalau belum ada main tab aktif, render langsung
+    if not self.activeMainKey then
+        self:_renderFooter(list)
+    else
+        -- kalau tab aktif belum punya footer khusus, pakai default
+        if not self.footerConfig[self.activeMainKey] then
+            self:_renderFooter(list)
+        end
+    end
+end
+
+-- FOOTER KHUSUS UNTUK MAIN TAB TERTENTU
+function MainUI:SetFooterButtonsFor(mainKey, list)
+    self.footerConfig[mainKey] = list
+    if self.activeMainKey == mainKey then
+        self:_renderFooter(list)
+    end
+end
+
+function MainUI:_setMinimized(state)
+    state = state and true or false
+    self.isMinimized = state
+
+    if state then
+        -- MINIMIZE: tutup panel utama, buka icon
+        if self.overlay then
+            self.overlay.Visible = false
+        end
+        if self.mainFrame then
+            self.mainFrame.Visible = false
+        end
+        if self._miniBtn then
+            self._miniBtn.Visible = true
+        end
+    else
+        -- RESTORE: buka panel utama, tutup icon
+        if self.overlay then
+            self.overlay.Visible = true
+        end
+        if self.mainFrame then
+            self.mainFrame.Visible = true
+        end
+        if self._miniBtn then
+            self._miniBtn.Visible = false
+        end
+    end
+end
+
+function MainUI:Minimize()
+    self:_setMinimized(true)
+end
+
+function MainUI:Restore()
+    self:_setMinimized(false)
+end
+
+return MainUI

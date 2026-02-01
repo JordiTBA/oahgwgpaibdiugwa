@@ -1,0 +1,497 @@
+-- WorldShardCleaner.lua
+-- Auto-cleanse world pets dengan mutasi BURUK saja (selain yang kamu tandai di state GBXP_MUT_SELECTED).
+-- â€¢ Mapping enum/huruf â†’ nama penuh via PetMutationRegistry (Nightmare = "A" aman)
+-- â€¢ Auto equip/unequip Cleansing Shard
+-- â€¢ Scan world models milik player sendiri
+-- â€¢ Rate limit ApplyShard
+
+-------------------------- Services & Modules --------------------------
+local Players = game:GetService("Players")
+local RS      = game:GetService("ReplicatedStorage")
+local WS      = game:GetService("Workspace")
+local CS      = game:GetService("CollectionService")
+
+local LP = Players.LocalPlayer
+
+-- Global env / state
+local GG    = (getgenv and getgenv()) or _G
+local STATE = (type(GG.STATE) == "table") and GG.STATE or nil
+
+-- Modules (ubah path bila berbeda di game kamu)
+local ActivePetsService = require(RS.Modules.PetServices.ActivePetsService)
+
+-- Registry resmi (dump yang kamu kirim)
+local PetMutReg         = require(RS.Data.PetRegistry.PetMutationRegistry)  -- berisi EnumToPetMutation & PetMutationToEnum
+local EnumToPetMutation = PetMutReg and PetMutReg.EnumToPetMutation or nil
+
+------------------------------ DEBUG -----------------------------------
+local DEBUG            = false
+local TRACE_OWNER      = false
+local TRACE_MUT_READ   = false
+local TRACE_WORLD_SCAN = false
+
+local function dprint(tag, ...)
+    if DEBUG then
+        print(("[ShardDebug/%s]"):format(tag), ...)
+    end
+end
+
+local function dx(tag, ...)
+    warn(("[ShardDebug/%s]"):format(tag), ...)
+end
+
+local function sf(fmt, ...)
+    local ok, msg = pcall(string.format, fmt, ...)
+    return ok and msg or (tostring(fmt) .. " (fmt-error)")
+end
+
+------------------------------- Config ---------------------------------
+local TARGET_PLAYER_NAME = LP and LP.Name or ""
+local ROOTS = {
+    WS:FindFirstChild("PetsPhysical"),
+    WS:FindFirstChild("ActivePets"),
+    WS:FindFirstChild("PetMover"),
+    WS, -- fallback, kalau struktur berbeda
+}
+
+-- Mutasi yang DIANGGAP BAIK sekarang diambil dari state:
+--   â€¢ Global: GBXP_MUT_SELECTED
+--   â€¢ Atau dari STATE (kalau kamu simpan di sana)
+--
+-- Jika tidak ada config, script TIDAK akan cleanse apapun (lebih aman).
+local SCAN_EVERY = 3
+local EQUIP_WAIT = 1
+local APPLY_GAP  = 1.5 -- rate limit antar ApplyShard
+
+------------------------------ Remote ----------------------------------
+local ge      = RS:FindFirstChild("GameEvents")
+local ShardRE = ge and ge:FindFirstChild("PetShardService_RE")
+
+------------------------------ Helpers ---------------------------------
+local function normalizeUUID(u)
+    if not u then return nil, nil end
+    local core = tostring(u):match("{?([0-9a-fA-F%-]+)}?") or tostring(u)
+    return core, "{" .. core .. "}"
+end
+
+local function ownedByTargetFromMover(mover)
+    -- Beberapa game beda nama atribut
+    local ownerName = mover:GetAttribute("OWNER")
+        or mover:GetAttribute("Owner")
+        or mover:GetAttribute("OwnerName")
+        or mover:GetAttribute("Player")
+
+    if TRACE_OWNER then
+        dprint("OWNER", sf("mover=%s ownerAttr=%s", mover:GetFullName(), tostring(ownerName)))
+    end
+
+    return ownerName == TARGET_PLAYER_NAME
+end
+
+-- Ambil record pet dari datastore berdasarkan UUID
+local function getPetRecordForUUID(uuid)
+    if not uuid or uuid == "" then return nil end
+
+    local core, braced = normalizeUUID(uuid)
+
+    local okStore, store = pcall(function()
+        return ActivePetsService:GetPlayerDatastorePetData(Players.LocalPlayer.Name)
+    end)
+
+    if not okStore or not store or not store.PetInventory or not store.PetInventory.Data then
+        return nil
+    end
+
+    local bag = store.PetInventory.Data
+    local rec = bag[core] or bag[braced]
+    if type(rec) == "table" then
+        return rec
+    end
+
+    return nil
+end
+
+-- Cek apakah pet di-favorite oleh player
+local function isFavoriteUUID(uuid)
+    local rec = getPetRecordForUUID(uuid)
+    if not rec then
+        return false
+    end
+
+    -- Beberapa kemungkinan nama field favorit
+    local fav =
+        rec.IsFavourite or rec.IsFavorite or rec.Favorite or
+        (rec.PetData and (rec.PetData.IsFavourite or rec.PetData.IsFavorite or rec.PetData.Favorite))
+
+    return fav == true
+end
+
+-- Ambil mutationType dari datastore pemain (bisa huruf 1 char atau nama penuh)
+local function getRawMutationFromUUID(uuid)
+    if not uuid or uuid == "" then return "" end
+
+    local rec = getPetRecordForUUID(uuid)
+    if rec then
+        local mt = rec.MutationType or (rec.PetData and rec.PetData.MutationType)
+        if type(mt) == "string" and mt ~= "" then
+            return mt
+        end
+    end
+
+    return ""
+end
+
+-- Normalisasi: huruf tunggal (termasuk "A") â†’ nama penuh via registry; kalau sudah nama, jadikan lowercase
+local function normalizeMutationNameLower(raw)
+    if not raw or raw == "" then return "" end
+
+    local s = tostring(raw)
+    if #s == 1 and EnumToPetMutation then
+        -- registry bisa case-sensitive; coba 3 varian
+        local full = EnumToPetMutation[s] or EnumToPetMutation[s:lower()] or EnumToPetMutation[s:upper()]
+        if type(full) == "string" and full ~= "" then
+            return full:lower()
+        end
+        -- fallback: kembalikan huruf (akan dianggap bukan bad jika tak cocok nama good)
+        return s:lower()
+    end
+
+    return s:lower()
+end
+
+-- Ambil GOOD MUTATIONS dari state (GBXP_MUT_SELECTED / STATE)
+local function getGoodMutationSetFromState()
+    local src
+
+    -- 1) Global GBXP_MUT_SELECTED (seperti di state.lua kamu)
+    if type(rawget(GG, "GBXP_MUT_SELECTED")) == "table" then
+        src = GG.GBXP_MUT_SELECTED
+    end
+
+    -- 2) Kalau kamu simpan juga di STATE.gbxp_mut (opsional)
+    if not src and STATE and type(STATE.gbxp_mut) == "table" then
+        src = STATE.gbxp_mut
+    end
+
+    -- 3) Atau nested di MAIN / nmlvl (kalau nanti kamu pindah schema)
+    if not src and STATE and STATE.main and STATE.main.nmlvl and STATE.main.nmlvl.state then
+        local st2 = STATE.main.nmlvl.state
+        if type(st2.GBXP_MUT_SELECTED) == "table" then
+            src = st2.GBXP_MUT_SELECTED
+        elseif type(st2.gbxp_mut) == "table" then
+            src = st2.gbxp_mut
+        end
+    end
+
+    local good = {}
+    if type(src) == "table" then
+        for mutName, on in pairs(src) do
+            if on then
+                good[tostring(mutName):lower()] = true
+            end
+        end
+    end
+
+    return good
+end
+
+local function isBadMutation(raw)
+    local nm = normalizeMutationNameLower(raw)
+
+    -- kalau tidak ada mutasi sama sekali, jangan di-cleanse
+    if nm == "" then
+        return false
+    end
+
+    local GOOD_MUTATIONS = getGoodMutationSetFromState()
+
+    -- kalau state belum set / kosong â†’ demi keamanan, JANGAN cleanse apa-apa
+    if not GOOD_MUTATIONS or next(GOOD_MUTATIONS) == nil then
+        if TRACE_MUT_READ then
+            dx("MUT", "GOOD_MUTATIONS dari state kosong â†’ skip cleanse semua")
+        end
+        return false
+    end
+
+    -- bad = semua mutasi yang TIDAK ada di GOOD_MUTATIONS
+    return not GOOD_MUTATIONS[nm]
+end
+
+-------------------------- Bridge dari UI GBXP --------------------------
+_G.WorldShardCleaner = _G.WorldShardCleaner or {}
+
+-- gbxpTable = GBXP_MUT_SELECTED dari UI (nama mutasi -> boolean)
+-- Sekarang ini hanya menyinkronkan ke global/state, tidak pakai GOOD_MUTATIONS lokal lagi.
+function _G.WorldShardCleaner:setGoodMutationsFromGBXP(gbxpTable)
+    if type(gbxpTable) ~= "table" then return end
+
+    -- Simpan ke global GBXP_MUT_SELECTED (dipakai state.lua juga)
+    GG.GBXP_MUT_SELECTED = {}
+    for mutName, on in pairs(gbxpTable) do
+        if on then
+            GG.GBXP_MUT_SELECTED[tostring(mutName)] = true
+        end
+    end
+
+    -- Opsional: mirror ke STATE.gbxp_mut
+    if STATE then
+        STATE.gbxp_mut = GG.GBXP_MUT_SELECTED
+    end
+end
+
+------------------------- World Model Collector -------------------------
+local function hasTagSafe(inst, tag)
+    -- Beberapa game monkey-patch :HasTag; tetap utamakan CollectionService
+    local okCs = pcall(function()
+        return CS:HasTag(inst, tag)
+    end)
+    if okCs then
+        return CS:HasTag(inst, tag)
+    end
+
+    if typeof(inst.HasTag) == "function" then
+        local ok, res = pcall(inst.HasTag, inst, tag)
+        if ok then return res end
+    end
+
+    return false
+end
+
+local function collectPetModelsForOwner()
+    local out, seen = {}, {}
+
+    for _, root in ipairs(ROOTS) do
+        if root then
+            for _, inst in ipairs(root:GetDescendants()) do
+                if inst:IsA("Model") and hasTagSafe(inst, "PetModel") then
+                    local mover = inst.Parent
+                    if mover and mover:IsA("BasePart") and ownedByTargetFromMover(mover) then
+                        local uuid = mover:GetAttribute("UUID")
+                            or mover:GetAttribute("Guid")
+                            or mover:GetAttribute("GUID")
+                            or mover:GetAttribute("Id")
+
+                        local core = uuid and normalizeUUID(uuid)
+                        core = type(core) == "table" and core[1] or core
+                        if core and not seen[core] then
+                            seen[core] = true
+                            table.insert(out, { uuid = core, model = inst, mover = mover })
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if TRACE_WORLD_SCAN then
+        dprint("SCAN", sf("Kumpul %d pet model milik %s", #out, TARGET_PLAYER_NAME))
+    end
+
+    return out
+end
+
+------------------------- Auto Equip / Unequip --------------------------
+local function getShardTool()
+    local backpack = LP:FindFirstChild("Backpack")
+    if not backpack then return nil end
+
+    for _, tool in ipairs(backpack:GetChildren()) do
+        if tool:IsA("Tool") and tool.Name:find("Cleansing") then
+            return tool
+        end
+    end
+
+    return nil
+end
+
+-- Unequip SEMUA tool dari character â†’ pindah ke Backpack
+local function unequipAllToolsFromCharacter()
+    local char     = LP.Character
+    local backpack = LP:FindFirstChild("Backpack") or LP.Backpack
+
+    if not char or not backpack then
+        return
+    end
+
+    for _, inst in ipairs(char:GetChildren()) do
+        if inst:IsA("Tool") then
+            inst.Parent = backpack
+        end
+    end
+end
+
+local function isEquipped()
+    local char = LP.Character
+    if not char then return false, nil end
+
+    for _, tool in ipairs(char:GetChildren()) do
+        if tool:IsA("Tool") and tool.Name:find("Cleansing") then
+            return true, tool
+        end
+    end
+
+    return false, nil
+end
+
+-- Pastikan Cleansing Shard KEPEgang:
+-- 1) kalau sudah pegang â†’ ok
+-- 2) kalau belum:
+--    - unequip semua tool lain dari character
+--    - ambil shard dari Backpack
+--    - equip ke character
+local function ensureEquipped()
+    local char = LP.Character
+    if not char then
+        dx("EQUIP", "Character belum siap, skip equip shard")
+        return false
+    end
+
+    -- kalau sudah pegang shard â†’ langsung ok
+    local eq, tool = isEquipped()
+    if eq and tool then
+        return true, tool
+    end
+
+    -- sebelum equip shard, lepas SEMUA tool dari character
+    unequipAllToolsFromCharacter()
+
+    -- cari shard di backpack
+    local shard = getShardTool()
+    if not shard then
+        dx("EQUIP", "Shard tidak ditemukan di Backpack!")
+        return false
+    end
+
+    dprint("EQUIP", "Equipping shard...")
+    shard.Parent = char
+    task.wait(EQUIP_WAIT)
+
+    -- double check
+    local ok2, tool2 = isEquipped()
+    if ok2 and tool2 then
+        return true, tool2
+    else
+        dx("EQUIP", "Gagal equip Cleansing Shard (tidak muncul di character)")
+        return false
+    end
+end
+
+-- Lepas shard dari character (balik ke Backpack)
+local function ensureUnequipped()
+    local eq, tool = isEquipped()
+    if eq and tool then
+        dprint("EQUIP", "Unequipping shard...")
+        tool.Parent = LP:FindFirstChild("Backpack") or LP.Backpack
+        task.wait(EQUIP_WAIT)
+    end
+end
+
+----------------------------- Cleanse call ------------------------------
+local _lastSendAt = 0
+
+local function fireCleanseModel(model)
+    if not ShardRE then
+        dx("SHARD", "Remote PetShardService_RE tidak ditemukan.")
+        return false
+    end
+
+    local now   = workspace:GetServerTimeNow()
+    local since = now - _lastSendAt
+    if since < APPLY_GAP then
+        task.wait(APPLY_GAP - since)
+    end
+    _lastSendAt = workspace:GetServerTimeNow()
+
+    local ok, err = pcall(function()
+        -- Sesuai log kamu: "ApplyShard", <Instance>
+        ShardRE:FireServer("ApplyShard", model)
+    end)
+
+    if ok then
+        dprint("SHARD", "ApplyShard OK â†’", model:GetFullName())
+        return true
+    else
+        dx("SHARD", "ApplyShard error:", tostring(err))
+        return false
+    end
+end
+
+------------------------------- Main ------------------------------------
+local RUN = false
+
+task.spawn(function()
+    while true do
+        if RUN then
+            local pets       = collectPetModelsForOwner()
+            local badTargets = {}
+
+            -- filter pet dengan mutasi "buruk"
+            for _, it in ipairs(pets) do
+                -- ðŸ”’ SKIP kalau pet ini favorite
+                if isFavoriteUUID(it.uuid) then
+                    if DEBUG then
+                        dprint("FAV", sf("Skip shard untuk pet favorite uuid=%s", tostring(it.uuid)))
+                    end
+                else
+                    local raw = getRawMutationFromUUID(it.uuid)
+                    local bad = isBadMutation(raw)
+
+                    if TRACE_MUT_READ then
+                        dx(
+                            "MUT",
+                            sf(
+                                "uuid=%s raw=%s -> norm=%s -> bad=%s",
+                                tostring(it.uuid),
+                                tostring(raw),
+                                normalizeMutationNameLower(raw),
+                                tostring(bad)
+                            )
+                        )
+                    end
+
+                    if bad then
+                        table.insert(badTargets, it)
+                    end
+                end
+            end
+
+            if #badTargets > 0 then
+                -- sebelum cleanse: pastikan shard ke-equip (akan auto unequip semua tool lain)
+                if ensureEquipped() then
+                    for _, it in ipairs(badTargets) do
+                        fireCleanseModel(it.model)
+                        task.wait(0.10)
+                    end
+                end
+
+                -- sesudah dipakai, shard dilepas lagi
+                ensureUnequipped()
+            else
+                -- tidak ada bad pet, pastikan shard juga tidak nempel di tangan
+                ensureUnequipped()
+            end
+
+            dprint("LOOP", sf("Selesai loop | badCount=%d", #badTargets))
+        end
+
+        task.wait(SCAN_EVERY)
+    end
+end)
+
+------------------------------- Hotkeys / Bridge ------------------------
+function _G.WorldShardCleaner:getRun()
+    return RUN
+end
+
+function _G.WorldShardCleaner:setRun(v)
+    RUN = not not v
+    -- dprint("CFG", "[ShardCleaner] RUN => " .. (RUN and "ON" or "OFF"))
+end
+
+-- Alias lebih jelas untuk dipakai dari UI / state
+function _G.WorldShardCleaner:setEnabled(v)
+    self:setRun(v)
+end
+
+-- Fallback flag polling (opsional)
+return _G.WorldShardCleaner

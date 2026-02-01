@@ -1,0 +1,643 @@
+-- pet_list_view.lua
+-- Helper untuk membangun list pet per tab.
+-- Output utama:
+--   M.buildEntriesForTab(tabKey, selectedSet)
+--     â†’ { { key=uuid, name="Label ..." }, ... }
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local LocalPlayer = Players.LocalPlayer
+local HttpService = game:GetService("HttpService")
+
+-- Modul game yang dipakai
+local PetsService       = require(ReplicatedStorage.Modules.PetServices.PetsService)
+local PetRegistry       = require(ReplicatedStorage.Data.PetRegistry)
+local ActivePetsService = require(ReplicatedStorage.Modules.PetServices.ActivePetsService)
+local PetUtilities      = require(ReplicatedStorage.Modules.PetServices.PetUtilities)
+local mutationModule    = require(ReplicatedStorage.Data.PetRegistry.PetMutationRegistry)
+local Backpack = LocalPlayer:WaitForChild("Backpack")
+
+-- SESUAI contohmu: DataService.InventoryData
+local DataService = require(ReplicatedStorage.Modules.DataService)
+local PetList = require(ReplicatedStorage.Data.PetRegistry.PetList)
+
+-------------------------------------------------------------
+-- 1) MUTATION MAP: EnumId (a, b, c, A, B, ...) â†’ Nama mutasi
+-------------------------------------------------------------
+local MUT_CODE_TO_NAME = {}
+-------------------------------------------------------------
+-- 1b) Daftar master nama mutasi (untuk UI dropdown, dll)
+-------------------------------------------------------------
+local MUTATION_LIST = {}
+
+local function __build_mutation_list()
+    -- modul yang sama dengan di atas (mutationModule)
+    -- bisa punya field PetMutationRegistry atau langsung table mutasi
+    local reg = mutationModule and (mutationModule.PetMutationRegistry or mutationModule)
+
+    if type(reg) ~= "table" then
+        warn("[PetListView] PetMutationRegistry invalid untuk MUTATION_LIST:", typeof(reg))
+        return
+    end
+
+    for mutName, info in pairs(reg) do
+        -- kalau mau filter: contoh hanya yang AvaliableFromMutationMachine
+        -- if info.AvaliableFromMutationMachine then
+        --     table.insert(MUTATION_LIST, mutName)
+        -- end
+
+        -- sekarang: ambil semua nama mutasi
+        table.insert(MUTATION_LIST, mutName)
+    end
+
+    table.sort(MUTATION_LIST, function(a, b)
+        return tostring(a) < tostring(b)
+    end)
+end
+
+__build_mutation_list()
+
+
+
+do
+    local reg = mutationModule and mutationModule.PetMutationRegistry
+    if type(reg) == "table" then
+        for mutName, def in pairs(reg) do
+            if type(def) == "table" then
+                local code = def.EnumId       -- 'a','b','c','A',...
+                if type(code) == "string" and #code == 1 then
+                    MUT_CODE_TO_NAME[code] = mutName
+                end
+            end
+        end
+    else
+        warn("[PetListView] PetMutationRegistry invalid:", typeof(reg))
+    end
+end
+
+-------------------------------------------------------------
+-- 2) Helper kecil (UUID, number, scale, dst)
+-------------------------------------------------------------
+local function __normUUID(u)
+    if not u or u == "" then return nil, nil end
+    local core = tostring(u):match("{?([0-9a-fA-F%-]+)}?") or tostring(u)
+    return core, "{"..core.."}"
+end
+
+local function __toNumberKG(v)
+    if v == nil then return nil end
+    if type(v) == "number" then return v end
+    local s = tostring(v):lower()
+    s = s:gsub("[^%d%,%.]+", "")
+    s = s:gsub(",", ".")
+    return tonumber(s)
+end
+
+local SCALE_PER_LVL = PetRegistry.PetConfig.WEIGHT_CONFIG.SCALE_PERCENTAGE_OF_BASE_WEIGHT_PER_LEVEL
+
+local function __number_from_candidates(tbl, keys, srcOut)
+    for _,k in ipairs(keys) do
+        local v = tbl[k]
+        if type(v) == "number" then
+            if srcOut then srcOut[1]=k end
+            return v
+        end
+        if type(v) == "string" then
+            local n = tonumber((v:gsub(",", ".")))
+            if n then
+                if srcOut then srcOut[1]=k end
+                return n
+            end
+        end
+    end
+    return nil
+end
+
+local function __age_from_record(rec, srcOut)
+    local PD = rec.PetData or rec.Data or {}
+    return __number_from_candidates(rec, {"Age","age","Level","level"}, srcOut)
+        or __number_from_candidates(PD,  {"Age","age","Level","level"}, srcOut)
+end
+
+local function __base_from_record(rec, srcOut)
+    local PD = rec.PetData or rec.Data or {}
+    return __number_from_candidates(rec, {"BaseWeight","BaseWeightKG","WeightBase","baseWeight","base_weight"}, srcOut)
+        or __number_from_candidates(PD,  {"BaseWeight","BaseWeightKG","WeightBase","baseWeight","base_weight"}, srcOut)
+end
+
+local function __current_from_record(rec, srcOut)
+    local PD = rec.PetData or rec.Data or {}
+    return __number_from_candidates(rec, {"Weight","weight","KG","kg","W","w","WeightNow","weight_now","currentWeight"}, srcOut)
+        or __number_from_candidates(PD,  {"Weight","weight","KG","kg","W","w","WeightNow","weight_now","currentWeight"}, srcOut)
+end
+
+-- FAVORITE langsung dari datastore
+local function __is_favorite(rec)
+    if type(rec) ~= "table" then return false end
+    local PD = rec.PetData or rec.Data or {}
+
+    if typeof(PD.IsFavorite) == "boolean" then
+        return PD.IsFavorite
+    end
+    if typeof(rec.IsFavorite) == "boolean" then
+        return rec.IsFavorite
+    end
+    return false
+end
+
+-------------------------------------------------------------
+-- 3) Mutation names dari record
+-------------------------------------------------------------
+local function __mutation_names_from_record(rec)
+    if type(rec) ~= "table" then return {} end
+
+    local PD = rec.PetData or rec.Data or {}
+
+    local raw =
+        PD.MutationType or
+        rec.MutationType  or
+        PD.Mutations      or PD.Mutation or PD.MutationCodes or
+        rec.Mutations     or rec.Mutation or rec.MutationCodes
+
+    if not raw then
+        return {}
+    end
+
+    local codes = {}
+
+    if type(raw) == "string" then
+        for c in raw:gmatch("%a") do
+            table.insert(codes, c)
+        end
+    elseif type(raw) == "table" then
+        for _, v in pairs(raw) do
+            if type(v) == "string" then
+                for c in v:gmatch("%a") do
+                    table.insert(codes, c)
+                end
+            elseif type(v) == "table" and type(v.MutationType) == "string" then
+                for c in v.MutationType:gmatch("%a") do
+                    table.insert(codes, c)
+                end
+            end
+        end
+    end
+
+    local names, seen = {}, {}
+    for _, code in ipairs(codes) do
+        local name = MUT_CODE_TO_NAME[code]
+        if name and not seen[name] then
+            seen[name] = true
+            table.insert(names, name)
+        end
+    end
+
+    return names
+end
+
+-------------------------------------------------------------
+-- 4) Ambil bag dari datastore
+-------------------------------------------------------------
+local function __getStoreBag()
+    if not ActivePetsService or not ActivePetsService.GetPlayerDatastorePetData then
+        warn("[PetListView] ActivePetsService:GetPlayerDatastorePetData not available")
+        return nil
+    end
+
+    local ok, store = pcall(function()
+        return ActivePetsService:GetPlayerDatastorePetData(LocalPlayer.Name)
+    end)
+    if not ok then
+        warn("[PetListView] GetPlayerDatastorePetData error:", store)
+        return nil
+    end
+    if not store or not store.PetInventory or not store.PetInventory.Data then
+        warn("[PetListView] Store/PetInventory/Data empty")
+        return nil
+    end
+
+    return store.PetInventory.Data
+end
+
+------------------------------------------------------------
+-- GBXP HELPERS (mirip logic syncGBXPFromStoreOnce lama)
+------------------------------------------------------------
+local function _getSelectedGlobal()
+    local G = (getgenv and getgenv()) or _G
+    return rawget(G, "selected") or rawget(getfenv(0), "selected") or {}
+end
+
+local function _normUUIDCore(u)
+    if not u then return nil end
+    local core = tostring(u):match("{?([0-9a-fA-F%-]+)}?") or tostring(u)
+    return core
+end
+
+-- cek apakah uuid sudah dipakai di tab lain (noos/boost/xp/seratusage)
+local function _in_other_tabs(uuid)
+    local core = _normUUIDCore(uuid)
+    if not core then return false end
+
+    local sel = _getSelectedGlobal()
+    local function has(tbl)
+        if type(tbl) ~= "table" then return false end
+        if tbl[uuid] or tbl["{"..core.."}"] or tbl[core] then
+            return true
+        end
+        for k,_ in pairs(tbl) do
+            local kc = _normUUIDCore(k)
+            if kc == core then return true end
+        end
+        return false
+    end
+
+    return has(sel.noos) or has(sel.boost) or has(sel.xp) or has(sel.seratusage)
+end
+
+-- whitelist type (pakai _G.GBXP_TYPE_WHITELIST kalau ada)
+local function _get_gbxp_whitelist()
+    local G = (getgenv and getgenv()) or _G
+    local w = rawget(G, "GBXP_TYPE_WHITELIST")
+           or rawget(getfenv(0), "GBXP_TYPE_WHITELIST")
+    if type(w) == "table" then
+        return w
+    end
+    return nil
+end
+
+local function _gbxp_whitelist_match(petTypeNorm)
+    petTypeNorm = tostring(petTypeNorm or ""):lower()
+    if petTypeNorm == "" then return false end
+
+    local w = _get_gbxp_whitelist()
+    -- kalau whitelist nil atau kosong â†’ semua lolos
+    if not w or (next(w) == nil) then
+        return true
+    end
+
+    for key,_ in pairs(w) do
+        local pat = tostring(key or ""):lower()
+        if pat ~= "" and petTypeNorm:find(pat, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+-- hitung W100 pakai helper yang SUDAH ada di file ini
+local function _weight_at_100_for_rec(rec, uuid)
+    local SCALE = SCALE_PER_LVL or 0
+    local age   = __age_from_record(rec)
+    local base  = __base_from_record(rec)
+    local cur   = __current_from_record(rec)
+
+    -- A) pakai base dari record
+    if base then
+        return base * (1 + SCALE * 100)
+    end
+
+    -- B) proyeksi dari current + age
+    if cur and age then
+        local delta = math.max(0, 100 - age)
+        return cur * (1 + SCALE * delta)
+    end
+
+    return nil
+end
+
+-- keputusan final: boleh jadi kandidat GBXP atau tidak
+local function _is_gbxp_candidate(rec, uuid, petTypeNorm, fav)
+    -- ambil config global kalau ada, kalau tidak pakai default
+    local G = (getgenv and getgenv()) or _G
+    local AGE_CUTOFF          = rawget(G, "AGE_CUTOFF")          or 101
+    local WEIGHT100_THRESHOLD = rawget(G, "WEIGHT100_THRESHOLD") or 120
+    local GBXP_SKIP_FAVORITE  = rawget(G, "GBXP_SKIP_FAVORITE")
+    if GBXP_SKIP_FAVORITE == nil then
+        GBXP_SKIP_FAVORITE = true
+    end
+
+    -- non-favorite only
+    if GBXP_SKIP_FAVORITE and fav then
+        return false
+    end
+
+    -- type whitelist
+    if not _gbxp_whitelist_match(petTypeNorm) then
+        return false
+    end
+
+    -- age check
+    local age = __age_from_record(rec)
+    if not age or age >= AGE_CUTOFF then
+        return false
+    end
+
+    -- W100 check
+    local w100 = _weight_at_100_for_rec(rec, uuid)
+    if not w100 or w100 >= WEIGHT100_THRESHOLD then
+        return false
+    end
+
+    -- tidak dipakai tab lain
+    if _in_other_tabs(uuid) then
+        return false
+    end
+
+    return true
+end
+
+-------------------------------------------------------------
+-- 5) List pet per tab
+-------------------------------------------------------------
+local function listPetsForTab(tabKey)
+    local pets = {}
+
+    local bag = __getStoreBag()
+    if not bag then
+        return pets
+    end
+
+    for rawUUID, rec in pairs(bag) do
+        if type(rec) == "table" then
+            local core, br = __normUUID(rawUUID)
+            local uuid = br or core
+
+            local fav = __is_favorite(rec) and true or false
+            local PD  = rec.PetData or rec.Data or {}
+
+            -- Ambil PetType
+            local petTypeRaw =
+                rec.Type or rec.PetType or
+                PD.Type  or PD.PetType  or
+                rec.Name or PD.Name     or
+                "Pet"
+
+            local petTypeLabel = tostring(petTypeRaw)
+            local petTypeNorm  = petTypeLabel:lower()
+
+            --------------------------------------------------------
+            -- RULE FILTER PER TAB
+            --------------------------------------------------------
+            local allowed
+            if tabKey == "gbxp" then
+                -- FULL RULE: whitelist, non-fav, age < AGE_CUTOFF,
+                -- W100 < WEIGHT100_THRESHOLD, tidak dipakai tab lain
+                allowed = _is_gbxp_candidate(rec, uuid, petTypeNorm, fav)
+            elseif tabKey == "noos" or tabKey == "boost"
+                or tabKey == "xp" or tabKey == "seratusage" then
+                -- Tab lain: hanya favorite
+                allowed = (fav == true)
+            else
+                allowed = true
+            end
+
+            if allowed then
+                -- Age / level sekarang
+                local age = __age_from_record(rec) or 0
+
+                -- BaseWeight dari datastore
+                local base = __base_from_record(rec)
+
+                -- KG sekarang
+                local kgNow
+                if base then
+                    local lvl   = age or 0
+                    local scale = SCALE_PER_LVL or 0
+                    kgNow = base * (1 + scale * lvl)
+                else
+                    kgNow = __current_from_record(rec)
+                end
+
+                local ageText = age > 0 and string.format("Age %d", age) or "Age ?"
+                local kgText  = kgNow and string.format("%.2f KG", kgNow) or "? KG"
+
+                local mutNames  = __mutation_names_from_record(rec)
+                local mutPrefix = ""
+                if #mutNames > 0 then
+                    mutPrefix = "[" .. table.concat(mutNames, ", ") .. "] "
+                end
+
+                local label = string.format("%s%s | %s | %s",
+                    mutPrefix,
+                    petTypeLabel,
+                    ageText,
+                    kgText
+                )
+
+                table.insert(pets, {
+                    uuid   = uuid,
+                    name   = label,
+                    age    = age or 0,
+                    kg     = kgNow or 0,
+                    ptype  = petTypeNorm,
+                })
+            end
+        end
+    end
+
+    table.sort(pets, function(a, b)
+        if a.ptype == b.ptype then
+            if a.age == b.age then
+                return a.kg < b.kg
+            end
+            return a.age < b.age
+        end
+        return a.ptype < b.ptype
+    end)
+
+    return pets
+end
+
+
+
+local function buildPetItems()
+    local list = {}
+
+    for petName, cfg in pairs(PetList) do
+        table.insert(list, {
+            key   = petName,        -- dipakai sebagai key di selectedMap
+            name  = petName,        -- teks di list
+            right = cfg.Rarity,     -- optional: tampilkan rarity di kanan (kalau CreateRowDropdown support)
+            icon  = cfg.Icon,       -- optional: kalau mau dipakai icon
+                     -- simpan config full kalau perlu
+        })
+    end
+
+    table.sort(list, function(a, b)
+        return a.name < b.name
+    end)
+
+    return list
+end
+
+
+local DataService
+do
+    local ok, mod = pcall(function()
+        return require(ReplicatedStorage.Modules.DataService)
+    end)
+    if ok then
+        DataService = mod
+    else
+        warn("[PetListView] Gagal require DataService:", mod)
+    end
+end
+
+local function __getInventoryDataTable()
+    if not DataService or type(DataService.GetData) ~= "function" then
+        warn("[PetListView] DataService atau GetData tidak tersedia")
+        return nil
+    end
+
+    local ok, profile = pcall(function()
+        return DataService:GetData()
+    end)
+    if not ok or type(profile) ~= "table" then
+        warn("[PetListView] DataService:GetData() gagal / profile bukan table:", profile)
+        return nil
+    end
+
+    local inv = profile.InventoryData
+    if type(inv) ~= "table" then
+        warn("[PetListView] profile.InventoryData kosong / bukan table")
+        return nil
+    end
+
+    return inv
+end
+
+
+-------------------------------------------------------------
+-- 6) List Item PetBoost dari InventoryData + Backpack
+-------------------------------------------------------------
+local function __listPetBoostItems()
+    local items = {}
+
+    local inv = __getInventoryDataTable()
+    if type(inv) ~= "table" then
+        return items
+    end
+
+    for rawUUID, rec in pairs(inv) do
+        if type(rec) == "table" and rec.ItemType == "PetBoost" then
+            local coreUUID = __normUUID(rawUUID)
+            if coreUUID then
+                -- ðŸ” CARI TOOL DI BACKPACK DULU
+                local prettyName = nil
+                for _, tool in ipairs(Backpack:GetChildren()) do
+                    local attr = tool:GetAttribute("c") or tool:GetAttribute("C")
+                    if attr then
+                        local attrCore = __normUUID(attr)
+                        if attrCore == coreUUID then
+                            prettyName = tool.Name
+                            break
+                        end
+                    end
+                end
+
+                -- â— KALAU TIDAK KETEMU DI BACKPACK â†’ SKIP
+                if prettyName and prettyName ~= "" then
+                    table.insert(items, {
+                        key  = coreUUID,   -- DISIMPAN: UUID
+                        name = prettyName, -- TAMPIL: nama tool di Backpack SAJA
+                    })
+                end
+            end
+        end
+    end
+
+    table.sort(items, function(a, b)
+        return a.name < b.name
+    end)
+
+    return items
+end
+
+
+
+
+local M = {}
+
+function M.buildEntriesForTab(tabKey, selectedSet)
+    selectedSet = selectedSet or {}
+    local pets = listPetsForTab(tabKey)
+
+    if tabKey == "gbxp" then
+        local empty = true
+        for _, v in pairs(selectedSet) do
+            if v then empty = false break end
+        end
+        if empty then
+            for _, p in ipairs(pets) do
+                selectedSet[p.uuid] = true
+            end
+        end
+    end
+
+    local result = {}
+    for _, p in ipairs(pets) do
+        table.insert(result, {
+            key  = p.uuid,
+            name = p.name,
+        })
+    end
+    return result
+end
+
+-- ðŸ”¹ INI WAJIB ADA
+function M.listPetsForTab(tabKey)
+    return listPetsForTab(tabKey)
+end
+
+function M.listAllMutations()
+    return MUTATION_LIST
+end
+
+function M.buildPetItems()
+    return buildPetItems()
+end
+
+function M.buildPetBoostItems()
+    return __listPetBoostItems()
+end
+
+-- Tambahan API untuk module lain (misalnya gift.lua)
+-- Mengembalikan:
+--   bag     â†’ tabel datastore (store.PetInventory.Data)
+--   index   â†’ map [core/bracedUUID] = rec
+--   helpers â†’ table berisi fungsi-fungsi helper (age, favorite, mutasi, w100, dll)
+function M.getDatastoreBagIndex()
+    local bag = __getStoreBag()
+    if not bag then
+        return nil, nil, nil
+    end
+
+    local index = {}
+    for rawUUID, rec in pairs(bag) do
+        if type(rec) == "table" then
+            local core, br = __normUUID(rawUUID)
+            if core then
+                index[core] = rec
+                if br then
+                    index[br] = rec
+                end
+            end
+        end
+    end
+
+    local helpers = {
+        normUUID                   = __normUUID,
+        age_from_record            = __age_from_record,
+        base_from_record           = __base_from_record,
+        current_from_record        = __current_from_record,
+        is_favorite                = __is_favorite,
+        mutation_names_from_record = __mutation_names_from_record,
+        weight_at_100_for_rec      = _weight_at_100_for_rec,
+    }
+
+    return bag, index, helpers
+end
+
+
+return M

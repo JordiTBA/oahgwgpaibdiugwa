@@ -1,0 +1,405 @@
+-- termux_script.lua
+-- Modul kecil untuk generate & simpan script Termux auto Roblox PS
+-- AUTO-GENERATE: ketika require, kalau file belum ada â†’ dibuat
+
+local TermuxScript = {}
+
+------------------------------------------------------------------
+-- DEBUG LOG
+------------------------------------------------------------------
+TermuxScript.DEBUG = false
+
+local function log(...)
+    if not TermuxScript.DEBUG then return end
+    warn("[TermuxScript]", ...)
+end
+
+local function logErr(...)
+    warn("[TermuxScript][ERR]", ...)
+end
+
+------------------------------------------------------------------
+-- AMBIL USERNAME ROBLOX (buat nama file JSON)
+------------------------------------------------------------------
+local USERNAME = "player"
+pcall(function()
+    local Players = game:GetService("Players")
+    local lp = Players.LocalPlayer
+    if lp and lp.Name and lp.Name ~= "" then
+        USERNAME = lp.Name
+    end
+end)
+log("USERNAME untuk Termux JSON =", USERNAME)
+
+------------------------------------------------------------------
+-- CONFIG DEFAULT
+------------------------------------------------------------------
+TermuxScript.CONFIG = {
+    scriptPath    = "workspace/roblox_ps_cycle.sh", -- lokasi file .sh (di sandbox executor)
+    pkg           = "com.roblox.client",            -- package Roblox
+    webLink       = "",                             -- fallback link kalau JSON kosong
+    mode          = 2,                              -- default mode (1 / 2) kalau JSON nggak ada
+    openWindow    = 30,                             -- default lama Roblox di depan (detik)
+    closeDelay    = 30,                             -- default lama di HOME (detik)
+    checkInterval = 10,                             -- (mode 1) interval cek proses (detik)
+}
+
+------------------------------------------------------------------
+-- BOOTSTRAP: storage & jq
+------------------------------------------------------------------
+local TERMUX_BOOTSTRAP = [[
+# ==== Termux bootstrap: storage & jq ====
+if [ ! -d "/storage/emulated/0" ]; then
+    echo "ðŸ” Meminta izin storage (termux-setup-storage)..."
+    termux-setup-storage
+    sleep 3
+fi
+
+if [ ! -d "/storage/emulated/0" ]; then
+    echo "âŒ Masih belum bisa akses /storage/emulated/0."
+    echo "   Cek Permission Termux â†’ Files, lalu jalankan ulang script."
+    exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+    echo "ðŸ“¦ jq belum ada, install dulu..."
+    pkg update -y
+    pkg install jq -y
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "âŒ Gagal install jq. Coba manual: pkg install jq"
+    fi
+fi
+
+]]
+
+------------------------------------------------------------------
+-- buildScript(): bikin string bash lengkap dari CONFIG
+------------------------------------------------------------------
+function TermuxScript.buildScript(cfg)
+    cfg = cfg or TermuxScript.CONFIG
+
+    local pkg           = cfg.pkg           or TermuxScript.CONFIG.pkg
+    local webLink       = cfg.webLink       or TermuxScript.CONFIG.webLink
+    local modeDefault   = tonumber(cfg.mode or TermuxScript.CONFIG.mode) or 2
+    local openWindow    = tonumber(cfg.openWindow    or TermuxScript.CONFIG.openWindow)    or 30
+    local closeDelay    = tonumber(cfg.closeDelay    or TermuxScript.CONFIG.closeDelay)    or 30
+    local checkInterval = tonumber(cfg.checkInterval or TermuxScript.CONFIG.checkInterval) or 10
+
+    -- JSON NodeHub AutoKG:
+    --  1) Delta Workspace
+    --  2) Roblox Workspace (gloop/external)
+    local jsonPathPrimary = ("/sdcard/Delta/Workspace/autosk/%s.json"):format(USERNAME)
+    local jsonPathAlt     = ("/storage/emulated/0/Android/data/com.roblox.client/files/gloop/external/Workspace/autosk/%s.json"):format(USERNAME)
+
+    log("buildScript()",
+        "modeDefault=", modeDefault,
+        "pkg=", pkg,
+        "webLink(default)=", webLink,
+        "openWindow(default)=", openWindow,
+        "closeDelay(default)=", closeDelay,
+        "checkInterval(default)=", checkInterval,
+        "jsonPathPrimary=", jsonPathPrimary,
+        "jsonPathAlt=", jsonPathAlt
+    )
+
+    ----------------------------------------------------------------
+    -- SATU SCRIPT UNTUK DUA MODE:
+    --  mode=1 : jaga Roblox tetap ON (keep-alive)
+    --  mode=2 : cycle join PRIVATE SERVER
+    --  mode & config diambil dari JSON setiap loop:
+    --      â€¢ BARU  : .auto_open_rblx.{enabled,mode,link,open_min,close_min}
+    --      â€¢ LEGACY: .main.misc.auto_open_roblox.{...}
+    ----------------------------------------------------------------
+    local script = ([[#!/data/data/com.termux/files/usr/bin/bash
+
+%s
+# Paket Roblox Android
+PKG=%q
+
+# File JSON NodeHub (PRIMARY & ALT)
+CONFIG_FILE_PRIMARY=%q
+CONFIG_FILE_ALT=%q
+CONFIG_FILE="$CONFIG_FILE_PRIMARY"
+
+# Default nilai kalau JSON tidak ada
+MODE_DEFAULT=%d
+WEB_LINK_DEFAULT=%q
+OPEN_WINDOW_DEFAULT=%d
+CLOSE_DELAY_DEFAULT=%d
+CHECK_INTERVAL_DEFAULT=%d
+
+# Runtime values (akan di-override dari JSON)
+MODE="$MODE_DEFAULT"
+ENABLED="false"
+WEB_LINK="$WEB_LINK_DEFAULT"
+OPEN_WINDOW=$OPEN_WINDOW_DEFAULT
+CLOSE_DELAY=$CLOSE_DELAY_DEFAULT
+CHECK_INTERVAL=$CHECK_INTERVAL_DEFAULT
+
+# ==== NORMALISASI MODE ====
+normalize_mode() {
+    local m="$1"
+    case "$m" in
+        1|"1"|"mode1"|"MODE1")
+            echo "1"
+            ;;
+        2|"2"|"mode2"|"MODE2"|*)
+            echo "2"
+            ;;
+    esac
+}
+
+# ==== PILIH CONFIG_FILE (PRIMARY / ALT) ====
+pick_config_file() {
+    if [ -f "$CONFIG_FILE_PRIMARY" ]; then
+        CONFIG_FILE="$CONFIG_FILE_PRIMARY"
+    elif [ -f "$CONFIG_FILE_ALT" ]; then
+        CONFIG_FILE="$CONFIG_FILE_ALT"
+    else
+        CONFIG_FILE=""
+    fi
+}
+
+# ==== BACA CONFIG DARI JSON ====
+load_config_from_json() {
+    pick_config_file
+
+    if [ -z "$CONFIG_FILE" ]; then
+        echo "âš ï¸  File JSON tidak ditemukan:"
+        echo "    PRIMARY = $CONFIG_FILE_PRIMARY"
+        echo "    ALT     = $CONFIG_FILE_ALT"
+        echo "    Pakai default bawaan script."
+        MODE="$MODE_DEFAULT"
+        ENABLED="true"
+        WEB_LINK="$WEB_LINK_DEFAULT"
+        OPEN_WINDOW=$OPEN_WINDOW_DEFAULT
+        CLOSE_DELAY=$CLOSE_DELAY_DEFAULT
+        CHECK_INTERVAL=$CHECK_INTERVAL_DEFAULT
+        return
+    fi
+
+    echo "ðŸ“„ Baca config dari: $CONFIG_FILE"
+
+    # enabled (schema baru & lama)
+    ENABLED=$(jq -r '
+        .auto_open_rblx.enabled
+        // .main.misc.auto_open_roblox.enabled
+        // false
+    ' "$CONFIG_FILE" 2>/dev/null || echo "false")
+
+    # mode (schema baru & lama)
+    local jm
+    jm=$(jq -r '
+        .auto_open_rblx.mode
+        // .main.misc.auto_open_roblox.mode
+        // ""
+    ' "$CONFIG_FILE" 2>/dev/null || echo "")
+    if [ "$jm" = "null" ] || [ "$jm" = "" ]; then
+        MODE="$MODE_DEFAULT"
+    else
+        MODE=$(normalize_mode "$jm")
+    fi
+
+    # link (schema baru & lama)
+    local link
+    link=$(jq -r '
+        .auto_open_rblx.link
+        // .main.misc.auto_open_roblox.link
+        // ""
+    ' "$CONFIG_FILE" 2>/dev/null || echo "")
+    if [ "$link" != "" ] && [ "$link" != "null" ]; then
+        WEB_LINK="$link"
+    else
+        WEB_LINK="$WEB_LINK_DEFAULT"
+    fi
+
+    # open / close dalam menit â†’ detik
+    local open_min close_min
+
+    open_min=$(jq -r '
+        .auto_open_rblx.open_min
+        // .auto_open_rblx.openWindow
+        // .main.misc.auto_open_roblox.open_min
+        // .main.misc.auto_open_roblox.openWindow
+        // 0
+    ' "$CONFIG_FILE" 2>/dev/null || echo "0")
+
+    close_min=$(jq -r '
+        .auto_open_rblx.close_min
+        // .auto_open_rblx.closeDelay
+        // .main.misc.auto_open_roblox.close_min
+        // .main.misc.auto_open_roblox.closeDelay
+        // 0
+    ' "$CONFIG_FILE" 2>/dev/null || echo "0")
+
+    if [ "$open_min" != "null" ] && [ "$open_min" != "0" ]; then
+        OPEN_WINDOW=$(( open_min * 60 ))
+    else
+        OPEN_WINDOW=$OPEN_WINDOW_DEFAULT
+    fi
+
+    if [ "$close_min" != "null" ] && [ "$close_min" != "0" ]; then
+        CLOSE_DELAY=$(( close_min * 60 ))
+    else
+        CLOSE_DELAY=$CLOSE_DELAY_DEFAULT
+    fi
+
+    echo "    enabled   = $ENABLED"
+    echo "    mode      = $MODE"
+    echo "    WEB_LINK  = $WEB_LINK"
+    echo "    open_min  = $open_min (â†’ $OPEN_WINDOW detik)"
+    echo "    close_min = $close_min (â†’ $CLOSE_DELAY detik)"
+}
+
+# ==== FUNGSI AKSI ====
+open_roblox_ps() {
+    am start -a android.intent.action.VIEW \
+      -d "$WEB_LINK" >/dev/null 2>&1
+
+    am start -a android.intent.action.VIEW \
+      -d "$WEB_LINK" \
+      -p "$PKG" >/dev/null 2>&1
+    echo "ðŸš€ Buka PRIVATE SERVER..."
+}
+
+close_roblox() {
+    echo "ðŸ  Tutup Roblox (HOME)..."
+    am start -a android.intent.action.MAIN -c android.intent.category.HOME >/dev/null 2>&1
+}
+
+ensure_roblox_alive() {
+    # MODE 1: jaga Roblox tetap nyala
+    if pidof "$PKG" >/dev/null 2>&1; then
+        echo "âœ… Roblox sudah jalan, tunggu $CHECK_INTERVAL detik..."
+    else
+        echo "ðŸš€ Roblox tidak aktif, buka lagi..."
+        open_roblox_ps
+    fi
+    sleep "$CHECK_INTERVAL"
+}
+
+# ==== MAIN LOOP ====
+termux-wake-lock
+
+cleanup() {
+    echo "ðŸ”š Stop script, lepas wakelock..."
+    termux-wake-unlock
+    exit 0
+}
+trap cleanup INT TERM EXIT
+
+echo "ðŸŸ¢ Roblox Termux helper (mode dinamis via JSON)"
+echo "    PRIMARY = $CONFIG_FILE_PRIMARY"
+echo "    ALT     = $CONFIG_FILE_ALT"
+
+while true; do
+    echo "==============================="
+    echo "ðŸ” REFRESH CONFIG DARI JSON..."
+    load_config_from_json
+
+    if [ "$ENABLED" != "true" ] && [ "$ENABLED" != "1" ]; then
+        echo "â¸ enabled=false â†’ tidur 10 detik..."
+        sleep 10
+        continue
+    fi
+
+    if [ "$MODE" = "1" ]; then
+        echo "ðŸŸ¢ MODE 1 (keep-alive) | CHECK_INTERVAL=$CHECK_INTERVAL"
+        ensure_roblox_alive
+    else
+        if [ -z "$WEB_LINK" ] || [ "$WEB_LINK" = "null" ]; then
+            echo "âš ï¸ WEB_LINK kosong di MODE 2, tidur 10 detik..."
+            sleep 10
+            continue
+        fi
+        echo "ðŸŸ¢ MODE 2 (cycle PS) | OPEN=$OPEN_WINDOW CLOSE=$CLOSE_DELAY"
+        open_roblox_ps
+        sleep "$OPEN_WINDOW"
+        close_roblox
+        echo "ðŸ˜´ Tunggu $CLOSE_DELAY detik sebelum siklus berikutnya..."
+        sleep "$CLOSE_DELAY"
+    fi
+done
+]]):format(
+        TERMUX_BOOTSTRAP,
+        pkg,
+        jsonPathPrimary,
+        jsonPathAlt,
+        modeDefault,
+        webLink,
+        openWindow,
+        closeDelay,
+        checkInterval
+    )
+
+    return script
+end
+
+
+------------------------------------------------------------------
+-- saveScript(): tulis script ke file (pakai writefile dari executor)
+------------------------------------------------------------------
+function TermuxScript.saveScript(cfg)
+    cfg = cfg or TermuxScript.CONFIG
+    local path    = cfg.scriptPath or TermuxScript.CONFIG.scriptPath
+    local content = TermuxScript.buildScript(cfg)
+
+    if not writefile then
+        logErr("saveScript(): writefile() tidak tersedia, tidak bisa tulis:", path)
+        return nil
+    end
+
+    log("saveScript() â†’ path:", path, "len:", #(content or ""))
+
+    local ok, err = pcall(writefile, path, content)
+    if not ok then
+        logErr("pcall(writefile) gagal:", err)
+        return nil
+    end
+
+    log("saveScript() OK:", path)
+    return path
+end
+
+------------------------------------------------------------------
+-- AUTO-GENERATE SAAT MODULE DI-LOAD
+------------------------------------------------------------------
+local function autoEnsureFile()
+    if not writefile then
+        logErr("autoEnsureFile(): writefile() tidak ada, skip generate")
+        return
+    end
+
+    local path   = TermuxScript.CONFIG.scriptPath
+    local exists = false
+
+    if type(isfile) == "function" then
+        local ok, res = pcall(isfile, path)
+        if not ok then
+            logErr("pcall(isfile) error:", res)
+        else
+            exists = res and true or false
+            log("isfile(", path, ") â†’", exists)
+        end
+    else
+        log("isfile() tidak tersedia di environment, anggap file belum ada")
+    end
+
+    if exists then
+        log("File Termux sudah ada, akan di-OVERWRITE:", path)
+    else
+        log("File belum ada, generate baru dari CONFIG default (JSON watcher)")
+    end
+
+    -- SELALU tulis ulang file, entah sebelumnya ada atau tidak
+    local createdPath = TermuxScript.saveScript(TermuxScript.CONFIG)
+    if createdPath then
+        log("Script Termux ditulis di:", tostring(createdPath))
+    else
+        logErr("Gagal generate script Termux (createdPath nil)")
+    end
+end
+
+pcall(autoEnsureFile)
+
+return TermuxScript

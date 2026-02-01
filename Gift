@@ -1,0 +1,843 @@
+-- gift.lua
+-- Auto Gift NodeHub (pakai PetListView sebagai data core)
+-- â€¢ Scan Tool pet di Backpack
+-- â€¢ Ambil record dari datastore via PetListView.getDatastoreBagIndex()
+-- â€¢ Filter per row GIFT_CFG (Gift 1/2/3):
+--      enabled / enabledB / enabledC
+--      targets / targetsB / targetsC
+--      minKG / minKGB / minKGC  (pakai W100, negatif = batas atas)
+--      minAge / minAgeB / minAgeC
+--          * 0  = age <= 1
+--          * >0 = age >= value
+--          * <0 = age <= |value|
+--      petType / petTypeB / petTypeC (map petName â†’ true, kosong = off)
+--      autoUnfav / autoUnfavB / autoUnfavC  (unfav sebelum gift)
+-- â€¢ Filter mutasi (GIFT_MUT_SELECTED, kalau ada)
+-- â€¢ Router target: player dengan pet Tool paling sedikit di Backpack
+-- â€¢ PAUSE AutoHatch saat ada pet yang digift, RESUME kalau sudah tidak ada yang dikirim
+
+----------------------------------------------------------------
+-- SERVICES & MODULES
+----------------------------------------------------------------
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- Backpack ref (akan di-refresh lagi kalau CharacterAdded)
+local Backpack = LocalPlayer:WaitForChild("Backpack")
+
+local GameEvents = ReplicatedStorage:WaitForChild("GameEvents", 5)
+local FavoriteItemRE = GameEvents and GameEvents:FindFirstChild("Favorite_Item")
+
+----------------------------------------------------------------
+-- PET LIST VIEW RESOLVER
+----------------------------------------------------------------
+local PetListView
+
+local function _resolvePetListView()
+    if PetListView then
+        return PetListView
+    end
+
+    local G = (getgenv and getgenv()) or _G
+    if G and type(G.PetListView) == "table" then
+        PetListView = G.PetListView
+        return PetListView
+    end
+
+    return nil
+end
+
+----------------------------------------------------------------
+-- AUTO HATCH PAUSE / RESUME (VERSI YANG KERJA)
+----------------------------------------------------------------
+local _hatchWasRunningForGift = false
+
+local function _getAutoHatchLoop()
+    local GG  = (getgenv and getgenv()) or _G
+    local loop = rawget(GG, "auto_hatchLoop") or rawget(_G, "auto_hatchLoop")
+    return loop, GG
+end
+
+local function _isAutoHatchRunning()
+    local loop, GG = _getAutoHatchLoop()
+    local running = false
+
+    if type(loop) == "table" then
+        if type(loop.IsRunning) == "function" then
+            local ok, res = pcall(function()
+                return loop:IsRunning()
+            end)
+            running = ok and res == true
+        else
+            running = (loop.running == true)
+        end
+    end
+
+    if not running then
+        local flag = rawget(GG, "__AUTO_HATCH_RUNNING") or rawget(_G, "__AUTO_HATCH_RUNNING")
+        running = (flag == true)
+    end
+
+    return running
+end
+
+local function _ensureAutoHatchStoppedForGift()
+    local loop = _getAutoHatchLoop()  -- ambil return pertama (loop)
+
+    if _hatchWasRunningForGift then
+        return
+    end
+
+    if _isAutoHatchRunning() then
+        _hatchWasRunningForGift = true
+        if type(loop) == "table" and type(loop.Stop) == "function" then
+            pcall(function()
+                -- pakai proxy dot-call dari auto_hatchLoop
+                loop.Stop("pause_for_gift")
+            end)
+        end
+        --print("[AutoGift] AutoHatch sedang jalan â†’ STOP sementara (pause_for_gift)")
+    end
+end
+
+local function _resumeAutoHatchIfNeeded()
+    if not _hatchWasRunningForGift then
+        return
+    end
+
+    local loop = _getAutoHatchLoop()  -- ambil return pertama (loop)
+
+    if type(loop) == "table" and type(loop.Start) == "function" then
+        pcall(function()
+            -- proxy dot-call
+            loop.Start()
+        end)
+    end
+
+    _hatchWasRunningForGift = false
+    --print("[AutoGift] AutoHatch di-resume setelah gift pass selesai")
+end
+
+----------------------------------------------------------------
+-- Gifting service (sesuaikan path kalau beda)
+----------------------------------------------------------------
+local PetGiftingService
+do
+    local ok, mod = pcall(function()
+        return require(ReplicatedStorage.Modules.PetServices.PetGiftingService)
+    end)
+    if ok then
+        PetGiftingService = mod
+    end
+end
+
+----------------------------------------------------------------
+-- CONFIG / DEBUG
+----------------------------------------------------------------
+local AUTO_GIFT_SCAN_INTERVAL      = 0.5      -- detik antar scan
+local AUTO_GIFT_MAX_SEND_PER_PASS  = 5        -- maksimal pet per loop
+local AUTO_GIFT_GIFT_DELAY         = 0        -- jeda kecil setelah gift
+local AUTO_GIFT_DEBUG              = false    -- ubah ke true untuk debug
+----------------------------------------------------------------
+-- KONSTAN: KEY KHUSUS UNTUK "TANPA MUTASI"
+----------------------------------------------------------------
+local NO_MUTATION_KEY   = "__NO_MUTATION__"
+local NO_MUTATION_LABEL = "[TANPA MUTASI]" -- cuma buat UI, di sini nggak dipakai
+
+GIFT_CFG = GIFT_CFG or {}
+
+----------------------------------------------------------------
+-- DEBUG UTIL
+----------------------------------------------------------------
+local function dbg(...)
+    if AUTO_GIFT_DEBUG then
+        print("[AutoGift]", ...)
+    end
+end
+
+local function _debugSkip(tag, reason, ...)
+    if not AUTO_GIFT_DEBUG then return end
+    print("[AutoGift][SKIP]", "["..tostring(tag).."]", reason, ...)
+end
+
+----------------------------------------------------------------
+-- FAVORITE HELPERS (Tool only)
+----------------------------------------------------------------
+local function isToolFavorited(tool)
+    if not tool or not tool:IsA("Tool") then return false end
+    return tool:GetAttribute("d") == true
+        or tool:GetAttribute("Favorite") == true
+        or tool:GetAttribute("IsFavorite") == true
+        or tool:GetAttribute("Fav") == true
+        or tool:GetAttribute("fav") == true
+end
+
+local function setToolFavorite(tool, wantFav)
+    if not tool or not FavoriteItemRE then
+        return false
+    end
+
+    local cur = (isToolFavorited(tool) == true)
+    wantFav = (wantFav == true)
+
+    if cur == wantFav then
+        -- status sudah sesuai, tidak usah kirim RE lagi
+        return false
+    end
+
+    local ok, err = pcall(function()
+        FavoriteItemRE:FireServer(tool)
+    end)
+
+    if not ok then
+        _debugSkip(tool.Name or "?", "fav_toggle_fail", err)
+        return false
+    end
+
+    dbg(string.format("[FAV] Toggle %s â†’ wantFav=%s", tool:GetFullName(), tostring(wantFav)))
+    return true
+end
+
+----------------------------------------------------------------
+-- BACKPACK & TOOL HELPER
+----------------------------------------------------------------
+local function _getBackpack()
+    return LocalPlayer:FindFirstChildOfClass("Backpack")
+        or LocalPlayer:FindFirstChild("Backpack")
+end
+
+local function _isPetTool(t)
+    if not (t and t:IsA("Tool")) then return false end
+    local it = t:GetAttribute("ItemType") or t:GetAttribute("Itemtype")
+    return it and string.lower(tostring(it)) == "pet"
+end
+
+local function _countTargetBackpack(plr)
+    if not (plr and plr:IsA("Player")) then
+        return math.huge
+    end
+    local bp = plr:FindFirstChild("Backpack")
+    if not bp then
+        return math.huge
+    end
+    local cnt = 0
+    for _, child in ipairs(bp:GetChildren()) do
+        if _isPetTool(child) then
+            cnt += 1
+        end
+    end
+    return cnt
+end
+
+local function _pickLeastBackpackTarget(targets)
+    if type(targets) ~= "table" or #targets == 0 then
+        return nil
+    end
+    if #targets == 1 then
+        return targets[1]
+    end
+
+    local best, bestCnt
+    for _, p in ipairs(targets) do
+        local c = _countTargetBackpack(p)
+        if not best or c < bestCnt then
+            best = p
+            bestCnt = c
+        end
+    end
+    return best or targets[1]
+end
+
+local function _unequipAllTools()
+    local char = LocalPlayer.Character
+    if not char then return end
+
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if hum then
+        pcall(function()
+            hum:UnequipTools()
+        end)
+    end
+
+    local bp = _getBackpack()
+    if not bp then return end
+
+    -- Pindahkan SEMUA tool dari character ke backpack
+    for _, obj in ipairs(char:GetChildren()) do
+        if obj:IsA("Tool") then
+            obj.Parent = bp
+        end
+    end
+
+    task.wait(0.05)
+end
+
+----------------------------------------------------------------
+-- TARGET: GIFT_CFG.targets / targetsB / targetsC
+----------------------------------------------------------------
+local function _getGiftTargets(which)
+    which = which or "targets"
+    local result = {}
+
+    if GIFT_CFG and GIFT_CFG[which] and next(GIFT_CFG[which]) ~= nil then
+        for key, info in pairs(GIFT_CFG[which]) do
+            local userId = info.userId or tonumber(key)
+            local name   = info.name
+
+            local plr
+            if userId then
+                plr = Players:GetPlayerByUserId(userId)
+            end
+
+            if (not plr) and name and name ~= "" then
+                local want = string.lower(name)
+                for _, p in ipairs(Players:GetPlayers()) do
+                    if string.lower(p.Name) == want then
+                        plr = p
+                        break
+                    end
+                end
+            end
+
+            if plr then
+                table.insert(result, plr)
+            end
+        end
+
+        return result
+    end
+
+    -- fallback lama (kalau config lama masih ada)
+    if which == "targets" then
+        local target
+        if GIFT_CFG and GIFT_CFG.targetUserId then
+            target = Players:GetPlayerByUserId(GIFT_CFG.targetUserId)
+        end
+        if (not target) and GIFT_CFG and GIFT_CFG.targetName and GIFT_CFG.targetName ~= "" then
+            local want = string.lower(GIFT_CFG.targetName)
+            for _, p in ipairs(Players:GetPlayers()) do
+                if string.lower(p.Name) == want then
+                    target = p
+                    break
+                end
+            end
+        end
+        if target then
+            table.insert(result, target)
+        end
+    end
+
+    return result
+end
+
+----------------------------------------------------------------
+-- PET TYPE FILTER (petType / petTypeB / petTypeC)
+----------------------------------------------------------------
+local function _passesPetType(petTypeNorm, cfgMap)
+    if not cfgMap or type(cfgMap) ~= "table" then
+        -- tidak ada map â†’ filter off
+        return true
+    end
+
+    local hasAny = false
+    for _, v in pairs(cfgMap) do
+        if v then
+            hasAny = true
+            break
+        end
+    end
+
+    if not hasAny then
+        -- tidak ada yang dipilih â†’ filter off (semua boleh)
+        return true
+    end
+
+    if not petTypeNorm or petTypeNorm == "" then
+        return false
+    end
+
+    for key, enabled in pairs(cfgMap) do
+        if enabled then
+            if petTypeNorm == tostring(key):lower() then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+----------------------------------------------------------------
+-- W100 / AGE FILTER
+--   kgRaw:
+--      >0  â†’ W100 >= kgRaw
+--      <0  â†’ W100 <= |kgRaw|
+--   ageRaw:
+--      0   â†’ age <= 1
+--      >0  â†’ age >= ageRaw
+--      <0  â†’ age <= |ageRaw|
+----------------------------------------------------------------
+local function _passesGiftGroup(weightArg, age, kgRaw, ageRaw)
+    kgRaw  = tonumber(kgRaw)  or 0
+    ageRaw = tonumber(ageRaw) or 0
+
+    local kgLimit   = math.abs(kgRaw)
+    local useMaxKG  = (kgRaw < 0)
+
+    -- AGE:
+    --  >0  â†’ age >= value
+    --  <0  â†’ age <= |value|
+    --   0  â†’ TIDAK filter umur (bebas)
+    local ageLimit  = math.abs(ageRaw)
+    local useMaxAge = (ageRaw < 0)
+
+    if kgLimit > 0 then
+        if (not useMaxKG) and weightArg < kgLimit then
+            return false
+        elseif useMaxKG and weightArg > kgLimit then
+            return false
+        end
+    end
+
+    if ageLimit > 0 then
+        if (not useMaxAge) and age < ageLimit then
+            return false
+        elseif useMaxAge and age > ageLimit then
+            return false
+        end
+    end
+
+    return true
+end
+
+
+----------------------------------------------------------------
+-- MUTASI FILTER per Gift group
+--   mutMap (map name â†’ true)
+--   Semantik BARU:
+--   â€¢ mutMap NIL / kosong  â†’ TIDAK filter mutasi (semua lolos)
+--   â€¢ mutMap punya NO_MUTATION_KEY = true  â†’ boleh pilih pet tanpa mutasi
+--   â€¢ mutMap punya nama mutasi lain       â†’ pet harus punya salah satu mutasi tsb
+--   Kombinasi:
+--      - Hanya [TANPA MUTASI]      â†’ hanya pet tanpa mutasi
+--      - Hanya ["Giant","Mini"]   â†’ hanya pet dengan Giant/Mini
+--      - [TANPA MUTASI]+["Giant"] â†’ pet tanpa mutasi ATAU punya Giant
+----------------------------------------------------------------
+local function _matchGiftMutation(rec, helpers, mutMap)
+    -- fallback: kalau mutMap nil, coba pakai global lama (kompat)
+    if mutMap == nil and type(GIFT_CFG) == "table" and type(GIFT_CFG.mut) == "table" then
+        mutMap = GIFT_CFG.mut
+    end
+
+    mutMap = (type(mutMap) == "table") and mutMap or {}
+
+    -- mutasi dari record
+    local muts   = helpers.mutation_names_from_record(rec) or {}
+    local hasMut = (#muts > 0)
+
+    -- cek apakah config punya pilihan (ada yang true)
+    local hasSelected = false
+    for _, v in pairs(mutMap) do
+        if v then
+            hasSelected = true
+            break
+        end
+    end
+
+    -- âŒ TIDAK ADA PILIHAN â†’ tidak filter mutasi sama sekali
+    if not hasSelected then
+        -- dbg("mut_cfg_empty â†’ no filter (ALL OK)")
+        return true
+    end
+
+    -- ðŸ” Pisah "no mutation" vs nama mutasi biasa
+    local wantNoMutation = false
+    local selNames       = {}
+
+    for name, on in pairs(mutMap) do
+        if on then
+            if name == NO_MUTATION_KEY then
+                wantNoMutation = true
+            else
+                selNames[string.lower(tostring(name))] = true
+            end
+        end
+    end
+
+    -- âœ… Kalau pet PUNYA mutasi
+    if hasMut then
+        -- Cek apakah salah satu mutasinya ada di selNames
+        for _, m in ipairs(muts) do
+            if selNames[string.lower(m)] then
+                dbg("mut_match", table.concat(muts, "+"))
+                return true
+            end
+        end
+
+        -- Pet punya mutasi, tapi:
+        --  â€¢ selNames nggak cocok
+        --  â€¢ kalau cuma "no mutation" yang dipilih â†’ harusnya SKIP
+        dbg("mut_has_mut_but_no_match", table.concat(muts, "+"))
+        return false
+    end
+
+    -- â— Pet TIDAK punya mutasi (hasMut == false)
+    if wantNoMutation then
+        dbg("mut_no_mutation_match (pet_no_mut)")
+        return true
+    end
+
+    -- Tidak punya mutasi, tapi user cuma pilih mutasi tertentu (tanpa NO_MUTATION)
+    dbg("mut_pet_no_mut_but_cfg_need_mut")
+    return false
+end
+
+
+
+----------------------------------------------------------------
+-- CORE GIVE
+----------------------------------------------------------------
+local function _give(uuidFmt, target, tool, allowUnfav)
+    allowUnfav = (allowUnfav == true)
+
+    if not PetGiftingService then
+        _debugSkip(uuidFmt, "PetGiftingService_nil")
+        return false
+    end
+
+    local useTool = tool
+    -- Cari Tool jika belum diberikan
+    if not useTool then
+        local bp = _getBackpack()
+        if bp then
+            for _, t in ipairs(bp:GetChildren()) do
+                if t:IsA("Tool") then
+                    local id = t:GetAttribute("PET_UUID")
+                        or t:GetAttribute("UUID")
+                        or t:GetAttribute("PetUUID")
+                    if id then
+                        local coreAttr = tostring(id):match("{?([0-9a-fA-F%-]+)}?") or tostring(id)
+                        local fmtAttr = "{" .. coreAttr .. "}"
+                        if fmtAttr == uuidFmt or coreAttr == uuidFmt then
+                            useTool = t
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if not useTool then
+        _debugSkip(uuidFmt, "tool_not_found")
+        return false
+    end
+
+    -- ðŸ”¹ LANGKAH 1: Pastikan semua tool di-unequip
+
+
+    ----------------------------------------------------------------
+    -- ðŸ”¹ LANGKAH 2: FAVORITE handling sesuai allowUnfav
+    ----------------------------------------------------------------
+    if isToolFavorited(useTool) then
+        if not allowUnfav then
+            -- autoUnfav = false â†’ pet fav = dilindungi, JANGAN gift
+            _debugSkip(uuidFmt, "favorited_autoUnfav_false_skip")
+            return false
+        end
+
+        -- autoUnfav = true â†’ boleh unfav dengan retry
+        local maxRetries = 1
+        local retryDelay = 0.3
+
+        for i = 1, maxRetries do
+            if isToolFavorited(useTool) then
+                dbg(string.format("[FAV] Attempt %d: Unfavoriting %s", i, useTool.Name))
+                setToolFavorite(useTool, false)
+                task.wait(retryDelay)
+            else
+                dbg(string.format("[FAV] Tool %s already unfavored", useTool.Name))
+                break
+            end
+        end
+
+        if isToolFavorited(useTool) then
+            _debugSkip(uuidFmt, "still_favorited_after_retry")
+            return false
+        end
+    end
+
+    ----------------------------------------------------------------
+    -- ðŸ”¹ LANGKAH 3: Equip tool
+    ----------------------------------------------------------------
+    local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum then
+        _debugSkip(uuidFmt, "no_humanoid")
+        return false
+    end
+    
+    _unequipAllTools()
+    task.wait(0.3)
+
+    useTool.Parent = char
+    task.wait(0.1)
+
+    pcall(function()
+        hum:EquipTool(useTool)
+    end)
+    task.wait(0.4) -- beri waktu lebih lama untuk sync
+
+    ----------------------------------------------------------------
+    -- ðŸ”¹ LANGKAH 4: Cek lagi fav SETELAH equip (hanya jika allowUnfav)
+    ----------------------------------------------------------------
+    if allowUnfav and isToolFavorited(useTool) then
+        dbg("[FAV] Still favored after equip â€” trying to unfav again")
+        setToolFavorite(useTool, false)
+        task.wait(0.3)
+    end
+
+    ----------------------------------------------------------------
+    -- ðŸ”¹ LANGKAH 5: Kirim gift
+    ----------------------------------------------------------------
+    local ok, res = pcall(function()
+        return PetGiftingService:GivePet(target)
+    end)
+
+    if not ok then
+        _debugSkip(uuidFmt, "GivePet_err", res)
+    end
+
+    -- ðŸ”¹ LANGKAH 6: Unequip lagi
+    task.wait(0.3)
+    _unequipAllTools()
+    task.wait(AUTO_GIFT_GIFT_DELAY)
+
+    return ok and res ~= false
+end
+
+
+----------------------------------------------------------------
+-- 1 PASS: SCAN BACKPACK & FILTER BY GIFT_CFG
+----------------------------------------------------------------
+local function _autoGiftPass()
+    local PLV = _resolvePetListView()
+    if not PLV or type(PLV.getDatastoreBagIndex) ~= "function" then
+        _debugSkip("PASS", "PetListView/getDatastoreBagIndex belum siap")
+        return
+    end
+
+    local bp = _getBackpack()
+    if not bp then
+        _debugSkip("PASS", "backpack_nil")
+        return
+    end
+
+    local bag, index, helpers = PLV.getDatastoreBagIndex()
+    if not bag or not index or not helpers then
+        _debugSkip("PASS", "datastore_bag_nil")
+        return
+    end
+
+    local cfg = GIFT_CFG or {}
+
+    -- Build target list per row
+    local targets1 = _getGiftTargets("targets")
+    local targets2 = _getGiftTargets("targetsB")
+    local targets3 = _getGiftTargets("targetsC")
+
+    local groups = {}
+
+    local function addGroup(id, enabledKey, targets, kgKey, ageKey, petTypeKey, autoUnfavKey, mutKey)
+    if not (cfg[enabledKey] == true) then
+        return
+    end
+    if not (targets and #targets > 0) then
+        return
+    end
+
+    table.insert(groups, {
+        id         = id,
+        targets    = targets,
+        kgRaw      = tonumber(cfg[kgKey])      or 0,
+        ageRaw     = tonumber(cfg[ageKey])     or 0,
+        petTypeMap = cfg[petTypeKey]          or {},
+        autoUnfav  = (cfg[autoUnfavKey] == true),
+        mutMap     = cfg[mutKey]              or {}, -- ðŸ”¹ NEW
+    })
+    end
+
+
+    -- Urutan prioritas: Gift 1 â†’ Gift 2 â†’ Gift 3
+-- Urutan prioritas: Gift 1 â†’ Gift 2 â†’ Gift 3
+addGroup("1", "enabled",  targets1, "minKG",  "minAge",  "petType",  "autoUnfav",  "mut")
+addGroup("2", "enabledB", targets2, "minKGB", "minAgeB", "petTypeB", "autoUnfavB", "mutB")
+addGroup("3", "enabledC", targets3, "minKGC", "minAgeC", "petTypeC", "autoUnfavC", "mutC")
+
+
+    if #groups == 0 then
+        if AUTO_GIFT_DEBUG then
+            dbg("NO ACTIVE GROUP (tidak ada Gift row yang enabled + punya target)")
+        end
+        -- tidak ada gift aktif â†’ kalau sebelumnya kita pause hatch, resume
+        _resumeAutoHatchIfNeeded()
+        return
+    end
+
+    local sent = 0
+
+    for _, tool in ipairs(bp:GetChildren()) do
+        if sent >= AUTO_GIFT_MAX_SEND_PER_PASS then
+            break
+        end
+
+        if _isPetTool(tool) then
+            local idAttr = tool:GetAttribute("PET_UUID")
+                or tool:GetAttribute("UUID")
+                or tool:GetAttribute("PetUUID")
+
+            if not idAttr then
+                _debugSkip(tool.Name, "no_uuid_attr")
+            else
+                local core, br = helpers.normUUID(idAttr)
+                local rec = index[core] or index[br]
+                local uuidFmt = br or ("{"..tostring(core or idAttr).."}")
+
+                if not rec then
+                    _debugSkip(uuidFmt, "rec_nil_in_datastore")
+                else
+                    local age  = helpers.age_from_record(rec)
+                    local w100 = helpers.weight_at_100_for_rec(rec)
+
+                    if (not age) or (not w100) then
+    _debugSkip(uuidFmt, "age_or_w100_nil", "age=", age, "w100=", w100)
+else
+    -- petType dari record (pakai logic sama dengan PetListView)
+    local PD = rec.PetData or rec.Data or {}
+    local petTypeRaw =
+        rec.Type or rec.PetType or
+        PD.Type  or PD.PetType  or
+        rec.Name or PD.Name     or
+        "Pet"
+    local petTypeLabel = tostring(petTypeRaw)
+    local petTypeNorm  = petTypeLabel:lower()
+
+    local chosenGroup
+    for _, grp in ipairs(groups) do
+        if _passesGiftGroup(w100, age, grp.kgRaw, grp.ageRaw)
+            and _passesPetType(petTypeNorm, grp.petTypeMap)
+            and _matchGiftMutation(rec, helpers, grp.mutMap)  -- ðŸ”¹ mutasi per Gift row
+        then
+            chosenGroup = grp
+            break
+        end
+    end
+
+    if not chosenGroup then
+        if AUTO_GIFT_DEBUG then
+            _debugSkip(
+                uuidFmt,
+                "group_fail_all",
+                "age=", age, "w100=", w100
+            )
+        end
+    else
+        local target = _pickLeastBackpackTarget(chosenGroup.targets)
+        if target then
+            _ensureAutoHatchStoppedForGift()
+
+            local okGive = _give(uuidFmt, target, tool, chosenGroup.autoUnfav)
+
+            if okGive then
+                sent += 1
+                dbg(
+                    ("SEND OK [Gift%s]"):format(chosenGroup.id),
+                    uuidFmt, "â†’", target.Name,
+                    "age=", age,
+                    "w100=", w100,
+                    "type=", petTypeLabel
+                )
+            else
+                _debugSkip(
+                    uuidFmt,
+                    "give_fail",
+                    "group", chosenGroup.id,
+                    "target", target.Name
+                )
+            end
+        else
+            _debugSkip(uuidFmt, "no_valid_target_in_group", chosenGroup.id)
+        end
+    end
+end
+
+                end
+            end
+        end
+    end
+
+    if AUTO_GIFT_DEBUG and sent == 0 then
+        dbg("Pass selesai, TIDAK ADA pet yang dikirim.")
+    end
+
+    -- kalau di pass ini tidak ada yang terkirim, dan sebelumnya kita sempat pause,
+    -- maka resume AutoHatch lagi
+    if sent == 0 then
+        _resumeAutoHatchIfNeeded()
+    end
+end
+
+----------------------------------------------------------------
+-- AUTO UPDATE BACKPACK REF
+----------------------------------------------------------------
+LocalPlayer.CharacterAdded:Connect(function()
+    task.delay(1, function()
+        Backpack = _getBackpack()
+    end)
+end)
+
+----------------------------------------------------------------
+-- MODULE API & LOOP START
+----------------------------------------------------------------
+local M = {}
+local _loopStarted = false
+
+local function _startLoop()
+    if _loopStarted then return end
+    _loopStarted = true
+
+    task.spawn(function()
+        dbg("AutoGift loop START (gift.lua pakai PetListView)")
+        while true do
+            local ok, err = pcall(_autoGiftPass)
+            if not ok then
+                warn("[AutoGift] ERROR dalam _autoGiftPass:", err)
+            end
+            task.wait(AUTO_GIFT_SCAN_INTERVAL)
+        end
+    end)
+end
+
+-- Auto start loop saat module di-require
+_startLoop()
+
+-- Optional API: manual single pass
+function M.RunOnePass()
+    local ok, err = pcall(_autoGiftPass)
+    if not ok then
+        warn("[AutoGift] RunOnePass error:", err)
+    end
+end
+
+-- Flag auto accept (listener-nya dibuat di module lain)
+function M.IsAutoAcceptGiftEnabled()
+    return GIFT_CFG and GIFT_CFG.autoAcceptGift == true
+end
+
+function M.IsAutoAcceptTradeEnabled()
+    return GIFT_CFG and GIFT_CFG.autoAcceptTrade == true
+end
+
+return M

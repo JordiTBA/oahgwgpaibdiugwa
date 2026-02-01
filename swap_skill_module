@@ -1,0 +1,478 @@
+-- swap_skill_module.lua (FIXED: STABLE COUNT)  STATE-DRIVEN SCAN INTERVAL
+-- âœ… scanInterval = murni dari STATE.swap_skill.scanInterval
+-- âœ… module TIDAK punya default scanInterval & TIDAK overwrite state
+-- âœ… kalau nil/invalid => fallback dipakai untuk perhitungan SAJA (tidak disimpan)
+
+local M = {}
+
+----------------------------------------------------------
+-- Services
+----------------------------------------------------------
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService        = game:GetService("RunService")
+
+local PetsService = require(ReplicatedStorage.Modules.PetServices.PetsService)
+local GetCDRF     = ReplicatedStorage.GameEvents:WaitForChild("GetPetCooldown")
+
+local LP = Players.LocalPlayer
+
+----------------------------------------------------------
+-- State (1 sumber: getgenv().STATE)
+----------------------------------------------------------
+local function GetSTATE()
+    local GG = (getgenv and getgenv()) or _G
+
+    local s = rawget(GG, "STATE")
+    if type(s) == "table" then return s end
+
+    local s2 = rawget(_G, "STATE")
+    if type(s2) == "table" then
+        GG.STATE = s2
+        return s2
+    end
+
+    local created = {}
+    GG.STATE = created
+    return created
+end
+
+local DEFAULT_DELAYS = { unequipAfterReady = 1, equipNext = 0.2 }
+
+local function _normUUID(u)
+    if u == nil then return nil end
+    local s = tostring(u)
+    local core = s:match("{?([0-9a-fA-F%-]+)}?") or s
+    if core == "" then return nil end
+    return "{" .. core .. "}"
+end
+
+local function toNum(v)
+    local n = tonumber(v)
+    return n
+end
+
+local function ensureSwapSkillState()
+    local STATE = GetSTATE()
+    STATE.swap_skill = STATE.swap_skill or {}
+    local ss = STATE.swap_skill
+
+    ss.selected   = ss.selected or {}
+    ss.order      = ss.order or {}
+    ss.delays     = ss.delays or {}
+    ss.skillCache = ss.skillCache or {}
+
+    ss.poll = tonumber(ss.poll) or 0.05
+    if ss.poll < 0.02 then ss.poll = 0.02 end
+
+    -- âœ… scanInterval: JANGAN di-set default di sini.
+    -- Kalau invalid/nil, biarin saja. Default urusan state.lua / UI.
+    -- Module cuma baca saat tick.
+
+    return ss
+end
+
+local function ensureDelay(uuid)
+    local ss = ensureSwapSkillState()
+    uuid = _normUUID(uuid)
+    if not uuid then return nil end
+
+    local d = ss.delays[uuid]
+    if type(d) ~= "table" then
+        d = {
+            unequipAfterReady = DEFAULT_DELAYS.unequipAfterReady,
+            equipNext         = DEFAULT_DELAYS.equipNext,
+        }
+        ss.delays[uuid] = d
+    end
+
+    d.unequipAfterReady = tonumber(d.unequipAfterReady)
+    if d.unequipAfterReady == nil or d.unequipAfterReady < 0 then
+        d.unequipAfterReady = DEFAULT_DELAYS.unequipAfterReady
+    end
+
+    d.equipNext = tonumber(d.equipNext)
+    if d.equipNext == nil or d.equipNext < 0 then
+        d.equipNext = DEFAULT_DELAYS.equipNext
+    end
+
+    return d
+end
+
+----------------------------------------------------------
+-- Cooldown helpers
+----------------------------------------------------------
+local UB_TOKENS = {}  -- kosong = AUTO
+local READY_TOL = 0
+
+local EXCLUDE_TOKENS = {
+    "mutation", "mutasi",
+    "tethered",
+    "shiny", "sparkling",
+    "boost",
+}
+
+local function _normSkillLabel(s)
+    s = string.lower(tostring(s or ""))
+    s = s:gsub("%b[]", "")
+         :gsub("[^%w%s]", " ")
+         :gsub("%s+", " ")
+    return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function _labelHasAny(labelNorm, tokens)
+    for _, tok in ipairs(tokens or {}) do
+        if tok and tok ~= "" and string.find(labelNorm, tok, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function _parseCooldownSeconds(v)
+    if type(v) == "number" then return v end
+    if type(v) ~= "string" then return 0 end
+
+    local s = v:lower()
+        :gsub(",", ".")
+        :gsub("%s+", " ")
+        :gsub("^%s*(.-)%s*$", "%1")
+
+    local m, sec = s:match("^(%d+)%s*:%s*(%d+)$")
+    if m and sec then
+        return (tonumber(m) or 0) * 60 + (tonumber(sec) or 0)
+    end
+
+    local mm = s:match("(%d+)%s*m")
+    local ss = s:match("(%d+)%s*s")
+    if mm or ss then
+        return (tonumber(mm) or 0) * 60 + (tonumber(ss) or 0)
+    end
+
+    return tonumber(s:match("[-+]?%d+%.?%d*")) or 0
+end
+
+local function _getCooldowns(uuid)
+    local ok, cds = pcall(function()
+        return GetCDRF:InvokeServer(uuid)
+    end)
+    if ok and type(cds) == "table" then
+        return cds
+    end
+    return nil
+end
+
+local function _findByCache(cds, cache)
+    if type(cds) ~= "table" or type(cache) ~= "table" then return nil end
+
+    local wantKind = cache.kind
+    local wantNorm = cache.labelNorm
+    if (wantKind ~= "Skill" and wantKind ~= "Passive") or type(wantNorm) ~= "string" or wantNorm == "" then
+        return nil
+    end
+
+    for _, cd in ipairs(cds) do
+        local raw = (wantKind == "Skill") and cd.Skill or cd.Passive
+        local ln  = _normSkillLabel(raw)
+        if ln ~= "" and ln == wantNorm then
+            return cd
+        end
+    end
+    return nil
+end
+
+local function _detectEntry(cds)
+    if type(cds) ~= "table" then return nil end
+
+    local autoMode = (type(UB_TOKENS) ~= "table") or (#UB_TOKENS == 0)
+
+    local bestObj, bestKind, bestLabelNorm, bestTime = nil, nil, nil, -math.huge
+
+    local function consider(cd, kind, rawLabel)
+        local ln = _normSkillLabel(rawLabel)
+        if ln == "" then return end
+        if _labelHasAny(ln, EXCLUDE_TOKENS) then return end
+        if (not autoMode) and (not _labelHasAny(ln, UB_TOKENS)) then
+            return
+        end
+
+        local t = _parseCooldownSeconds(cd.Time)
+        if t > bestTime then
+            bestTime = t
+            bestObj = cd
+            bestKind = kind
+            bestLabelNorm = ln
+        end
+    end
+
+    for _, cd in ipairs(cds) do
+        if type(cd) == "table" then
+            consider(cd, "Skill", cd.Skill)
+        end
+    end
+    for _, cd in ipairs(cds) do
+        if type(cd) == "table" then
+            consider(cd, "Passive", cd.Passive)
+        end
+    end
+
+    if bestObj then
+        return bestObj, bestKind, bestLabelNorm
+    end
+    return nil
+end
+
+local function getCooldown(uuid)
+    uuid = _normUUID(uuid)
+    if not uuid then return nil end
+
+    local ss = ensureSwapSkillState()
+    local cds = _getCooldowns(uuid)
+    if type(cds) ~= "table" then return nil end
+
+    local cached = ss.skillCache[uuid]
+    local cdObj = nil
+
+    if type(cached) == "table" then
+        cdObj = _findByCache(cds, cached)
+    end
+
+    if not cdObj then
+        local hit, kind, ln = _detectEntry(cds)
+        if hit then
+            cdObj = hit
+            ss.skillCache[uuid] = { kind = kind, labelNorm = ln }
+        else
+            ss.skillCache[uuid] = nil
+            return nil
+        end
+    end
+
+    return _parseCooldownSeconds(cdObj.Time)
+end
+
+----------------------------------------------------------
+-- Equip / Unequip safe
+----------------------------------------------------------
+local DEBUG = false
+local function log(...)
+    if not DEBUG then
+        print("[SwapSkill]", ...)
+    end
+end
+
+local function equip(uuid)
+    uuid = _normUUID(uuid)
+    if not uuid then return end
+    pcall(function()
+        PetsService:EquipPet(uuid)
+    end)
+end
+
+local function unequip(uuid)
+    uuid = _normUUID(uuid)
+    if not uuid then return end
+    pcall(function()
+        PetsService:UnequipPet(uuid)
+    end)
+end
+
+----------------------------------------------------------
+-- Ordered selected list
+----------------------------------------------------------
+local function buildSelectedOrdered()
+    local ss = ensureSwapSkillState()
+    local selected = ss.selected or {}
+    local order    = ss.order or {}
+
+    local out, used = {}, {}
+
+    for _, u in ipairs(order) do
+        u = _normUUID(u)
+        if u and selected[u] == true and not used[u] then
+            used[u] = true
+            table.insert(out, u)
+        end
+    end
+
+    for u, on in pairs(selected) do
+        if on then
+            u = _normUUID(u)
+            if u and not used[u] then
+                used[u] = true
+                table.insert(out, u)
+            end
+        end
+    end
+
+    return out
+end
+
+----------------------------------------------------------
+-- Runner (Heartbeat connection)
+----------------------------------------------------------
+local hbConn = nil
+local running = false
+
+local lastReady = {}  -- [uuid]=bool
+local busy      = {}  -- [uuid]=bool
+local lastTrig  = {}  -- [uuid]=time
+
+local acc = 0
+
+local function resetTrackers()
+    table.clear(lastReady)
+    table.clear(busy)
+    table.clear(lastTrig)
+    acc = 0
+end
+
+local function tick(dt)
+    if not running then return end
+
+    local ss = ensureSwapSkillState()
+    local poll = tonumber(ss.poll) or 0.05
+    if poll < 0.02 then poll = 0.02 end
+
+    acc += dt
+    if acc < poll then return end
+    acc = 0
+
+    local list = buildSelectedOrdered()
+    if #list <= 0 then return end
+
+    local now = os.clock()
+
+    -- âœ… scanInterval: baca dari STATE, fallback cuma untuk hitung (TIDAK nulis balik ke state)
+    -- kalau kamu mau 100% tanpa fallback: ganti "or 0" dan biar jadi selalu lolos limiter.
+    local minInterval = toNum(ss.scanInterval)
+    if minInterval == nil or minInterval <= 0 then
+        minInterval = 0.25 -- fallback runtime ONLY (bukan default permanen)
+    end
+
+    for _, uuid in ipairs(list) do
+        if not busy[uuid] then
+            local cd
+            local ok = pcall(function()
+                cd = getCooldown(uuid)
+            end)
+            if not ok then cd = nil end
+
+            if cd ~= nil then
+                local ready = (cd <= READY_TOL)
+                local wasReady = (lastReady[uuid] == true)
+
+                if (not wasReady) and ready then
+                    local lt = lastTrig[uuid] or 0
+                    if (now - lt) >= minInterval then
+                        lastTrig[uuid] = now
+                        busy[uuid] = true
+
+                        local d  = ensureDelay(uuid)
+                        local du = tonumber(d and d.unequipAfterReady) or DEFAULT_DELAYS.unequipAfterReady
+                        local de = tonumber(d and d.equipNext)         or DEFAULT_DELAYS.equipNext
+
+                        log("READY", uuid, "du", du, "de", de, "-> UNEQUIP+EQUIP SAME")
+
+                        task.delay(du, function()
+                            if not running then return end
+
+                            unequip(uuid)
+                            lastReady[uuid] = false
+
+                            task.delay(de, function()
+                                if not running then return end
+                                equip(uuid)
+                                busy[uuid] = false
+                            end)
+                        end)
+                    end
+                end
+
+                lastReady[uuid] = ready
+            else
+                lastReady[uuid] = false
+            end
+        end
+    end
+end
+
+----------------------------------------------------------
+-- Public API
+----------------------------------------------------------
+function M.SetDebug(on)
+    DEBUG = (on == true)
+end
+
+function M.SyncFromState()
+    local ss = ensureSwapSkillState()
+    local list = buildSelectedOrdered()
+    for _, uuid in ipairs(list) do
+        ensureDelay(uuid)
+        local c = ss.skillCache[uuid]
+        if type(c) == "table" then
+            local k = c.kind
+            local ln = c.labelNorm
+            if (k ~= "Skill" and k ~= "Passive") or type(ln) ~= "string" or ln == "" then
+                ss.skillCache[uuid] = nil
+            end
+        end
+    end
+end
+
+function M.Start()
+    
+        local ss = ensureSwapSkillState()
+
+    if ss.enabled == false and not force then
+        return false, "disabled by state"
+    end
+    ensureSwapSkillState()
+    if running then return true end
+    running = true
+    resetTrackers()
+
+    if hbConn then hbConn:Disconnect() end
+    hbConn = RunService.Heartbeat:Connect(tick)
+
+    _G.__SWAP_SKILL_RUNNING = true
+    return true
+end
+
+function M.Stop()
+    if not running then
+        return true, "already stopped"
+    end
+    running = false
+    _G.__SWAP_SKILL_RUNNING = false
+    if hbConn then hbConn:Disconnect() end
+    resetTrackers()
+    return true
+end
+
+-- âœ… setter: SET apa adanya (tanpa default 0.28, tanpa clamp)
+-- kalau input invalid => jangan overwrite
+function M.SetScanInterval(v)
+    local ss = ensureSwapSkillState()
+    local n = tonumber(v)
+    if n == nil then
+        return ss.scanInterval
+    end
+    ss.scanInterval = n
+    return ss.scanInterval
+end
+
+function M.IsRunning()
+    return running == true
+end
+
+-- publish ke global biar bisa dipanggil dari AutoHatch / AutoKG / UI
+do
+    local GG = (getgenv and getgenv()) or _G
+    GG.SwapSkill = M
+    _G.SwapSkill = M
+end
+
+
+
+return M

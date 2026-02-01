@@ -1,0 +1,1701 @@
+-- tabs_autokg.lua
+-- Main tab "Auto KG" â†’ sub tab:
+--   noos, boost, xp, seratusage, gbxp, settingkg(âš™)
+--
+-- âœ… Fitur:
+-- - Summary auto update global (walau tab lain sedang dibuka)
+-- - List bisa auto update (pakai listApi("setItems") + listApi("setSelected"))
+-- - GBXP auto-select kandidat baru (reconcile periodik, bukan seed sekali)
+-- - Footer: Mode picker + Start/Stop (GBXP_STAGE_MODE)
+
+local M = {}
+
+function M.Register(ui, STATE, PetListView)
+    ----------------------------------------------------------------
+    -- SAFETY DEFAULTS
+    ----------------------------------------------------------------
+    PetListView = PetListView or {
+        buildEntriesForTab = function() return {} end,
+        listPetsForTab     = function() return {} end,
+        listAllMutations   = function() return {} end,
+        buildPetItems      = function() return {} end,
+        buildPetBoostItems = function() return {} end,
+    }
+
+    STATE = STATE or {}
+
+    ----------------------------------------------------------------
+    -- helper autosave: pakai ui:SaveState() dari main.lua
+    ----------------------------------------------------------------
+    local function autoSave()
+        if ui and type(ui.SaveState) == "function" then
+            task.defer(function()
+                local ok, err = pcall(function()
+                    ui:SaveState()
+                end)
+                if not ok then
+                    warn("[AutoKG] Gagal ui:SaveState():", err)
+                end
+            end)
+        else
+            warn("[AutoKG] ui.SaveState() tidak tersedia, perubahan TIDAK di-persist.")
+        end
+    end
+
+    ----------------------------------------------------------------
+    -- GLOBALS yang dipakai state.lua
+    ----------------------------------------------------------------
+    selected = selected or {
+        boost      = {},
+        xp         = {},
+        noos       = {},
+        seratusage = {},
+        gbxp       = {},
+    }
+
+    TAB_AGE_EQUIP_MIN   = TAB_AGE_EQUIP_MIN   or {}
+    TAB_AGE_UNEQUIP_MIN = TAB_AGE_UNEQUIP_MIN or {}
+    TAB_W_EQUIP_MIN     = TAB_W_EQUIP_MIN     or {}
+    TAB_W_UNEQUIP_MAX   = TAB_W_UNEQUIP_MAX   or {}
+
+    local ALL_TABS = { "noos", "boost", "seratusage", "xp", "gbxp" }
+
+    local function ensureTabDefaults(tabKey)
+        TAB_AGE_EQUIP_MIN[tabKey]   = tonumber(TAB_AGE_EQUIP_MIN[tabKey])   or 0
+        TAB_AGE_UNEQUIP_MIN[tabKey] = tonumber(TAB_AGE_UNEQUIP_MIN[tabKey]) or 0
+
+        TAB_W_EQUIP_MIN[tabKey]     = tonumber(TAB_W_EQUIP_MIN[tabKey])     or 0
+        TAB_W_UNEQUIP_MAX[tabKey]   = tonumber(TAB_W_UNEQUIP_MAX[tabKey])   or 999999
+
+        selected[tabKey] = selected[tabKey] or {}
+    end
+
+    for _, k in ipairs(ALL_TABS) do
+        ensureTabDefaults(k)
+    end
+
+    ----------------------------------------------------------------
+    -- UI REGISTRY (biar bisa update walau tab lain aktif)
+    ----------------------------------------------------------------
+    local UIREF = {
+        tabs = {},         -- [tabKey] = { listApi=..., selSet=... }
+        summaryTitles = {},-- [tabKey] = summaryTitle
+    }
+
+    ----------------------------------------------------------------
+    -- Helper: hitung total selected & bikin teks summary
+    ----------------------------------------------------------------
+    local function countSelected(setTbl)
+        local n = 0
+        if type(setTbl) == "table" then
+            for _, on in pairs(setTbl) do
+                if on then n += 1 end
+            end
+        end
+        return n
+    end
+
+    local function buildSummaryText()
+        local cNoos  = countSelected(selected.noos)
+        local cBoost = countSelected(selected.boost)
+        local c100   = countSelected(selected.seratusage)
+        local cXP    = countSelected(selected.xp)
+        local cGBXP  = countSelected(selected.gbxp)
+
+        return string.format(
+            "ðŸ˜ Elephant (%d)    ðŸŒ™ Mutation (%d)    ðŸ’¯ 100 Age (%d)    ðŸ“˜ XP (%d)    ðŸ§ª GBXP (%d)",
+            cNoos, cBoost, c100, cXP, cGBXP
+        )
+    end
+
+    local function refreshAllSummary()
+        local txt = buildSummaryText()
+        for _, title in pairs(UIREF.summaryTitles) do
+            if title and title.Parent then
+                title.Text = txt
+            end
+        end
+    end
+
+    ----------------------------------------------------------------
+    -- LIST REFRESH (butuh CreateRowList API setItems & setSelected)
+    ----------------------------------------------------------------
+    local function refreshTabList(tabKey)
+        local ref = UIREF.tabs[tabKey]
+        if not ref or not ref.listApi or type(ref.listApi) ~= "function" then
+            return
+        end
+
+        local entries = {}
+        local ok, res = pcall(function()
+            return PetListView.buildEntriesForTab(tabKey, ref.selSet)
+        end)
+        if ok and type(res) == "table" then
+            entries = res
+        end
+
+        pcall(function()
+            ref.listApi("setItems", entries)
+        end)
+
+        local map = {}
+        for uuid, on in pairs(ref.selSet or {}) do
+            if on then map[uuid] = true end
+        end
+        pcall(function()
+            ref.listApi("setSelected", map)
+        end)
+    end
+
+    ----------------------------------------------------------------
+    -- AUTO SELECT GBXP (reconcile periodik)
+    ----------------------------------------------------------------
+    if STATE.gbxpAutoSelect == nil then
+        STATE.gbxpAutoSelect = true
+    end
+
+    local function reconcileGBXP()
+        if STATE.gbxpAutoSelect ~= true then
+            return
+        end
+
+        selected.gbxp = selected.gbxp or {}
+
+        local ok, pets = pcall(function()
+            return PetListView.listPetsForTab("gbxp")
+        end)
+        if not ok or type(pets) ~= "table" then
+            return
+        end
+
+        local changed = false
+        for _, p in ipairs(pets) do
+            local uuid = p and p.uuid
+            if uuid and not selected.gbxp[uuid] then
+                selected.gbxp[uuid] = true
+                changed = true
+            end
+        end
+
+        if changed then
+            autoSave()
+            refreshAllSummary()
+            refreshTabList("gbxp")
+        end
+    end
+
+    ----------------------------------------------------------------
+    -- MAIN TAB: Auto KG
+    ----------------------------------------------------------------
+    ui:RegisterMainTab("autokg", "Auto KG", 1)
+
+    ----------------------------------------------------------------
+    -- Helper: bangun satu sub-tab AutoKG generik
+    ----------------------------------------------------------------
+    local function buildAutoKGSubTab(tabKey, niceName, order)
+        ui:RegisterSubTab("autokg", tabKey, niceName, function()
+            ui:ClearSubContent()
+
+            ensureTabDefaults(tabKey)
+
+            -- list untuk menyimpan setter setiap section
+            local sectionSetters = {}
+            local function createSection(title)
+                local body, setExpanded = ui:CreateSection(title, true)
+                table.insert(sectionSetters, setExpanded)
+                return body
+            end
+
+            --------------------------------------------------------
+            -- SECTION: Threshold Age & KG untuk tab ini
+            --------------------------------------------------------
+            local sectionTitle = string.format("( %s Team ) Threshold Age & Kg", niceName)
+            local body = createSection(sectionTitle)
+
+            local selSet = selected[tabKey]
+
+            --------------------------------------------------------
+            -- ROW LABEL: SUMMARY TOTAL SEMUA TAB
+            --------------------------------------------------------
+            local summaryRow, summaryTitle
+            if ui.CreateRowLabel then
+                summaryRow, summaryTitle = ui:CreateRowLabel(body, buildSummaryText())
+            else
+                local row = Instance.new("Frame")
+                row.Name = "Row_Summary"
+                row.BackgroundTransparency = 1
+                row.Size = UDim2.new(1, 0, 0, 20)
+                row.Parent = body
+
+                local txt = Instance.new("TextLabel")
+                txt.BackgroundTransparency = 1
+                txt.Size = UDim2.new(1, 0, 1, 0)
+                txt.Font = Enum.Font.GothamSemibold
+                txt.TextSize = 12
+                txt.TextXAlignment = Enum.TextXAlignment.Left
+                txt.TextColor3 = Color3.fromRGB(255, 230, 120)
+                txt.TextWrapped = true
+                txt.Text = buildSummaryText()
+                txt.Parent = row
+
+                summaryRow   = row
+                summaryTitle = txt
+            end
+
+            if summaryTitle then
+                summaryTitle.TextColor3 = Color3.fromRGB(255, 230, 120)
+                summaryTitle.Font       = Enum.Font.GothamSemibold
+                summaryTitle.TextSize   = 12
+                summaryTitle.TextWrapped = true
+            end
+
+            -- register summary title untuk global refresh
+            UIREF.summaryTitles[tabKey] = summaryTitle
+
+            --------------------------------------------------------
+            -- 1) Equip Age
+            --------------------------------------------------------
+            ui:CreateRowInput(body, "Equip Age", tostring(TAB_AGE_EQUIP_MIN[tabKey]), function(text)
+                local v = tonumber(text)
+                if v then
+                    TAB_AGE_EQUIP_MIN[tabKey] = v
+                    autoSave()
+                else
+                    warn(string.format("[AutoKG/%s] Equip Age tidak valid: %s", tabKey, text))
+                end
+            end)
+
+            --------------------------------------------------------
+            -- 2) Unequip Age
+            --------------------------------------------------------
+            ui:CreateRowInput(body, "Unequip Age", tostring(TAB_AGE_UNEQUIP_MIN[tabKey]), function(text)
+                local v = tonumber(text)
+                if v then
+                    TAB_AGE_UNEQUIP_MIN[tabKey] = v
+                    autoSave()
+                else
+                    warn(string.format("[AutoKG/%s] Unequip Age tidak valid: %s", tabKey, text))
+                end
+            end)
+
+            --------------------------------------------------------
+            -- 3) Equip W100 Min
+            --------------------------------------------------------
+            ui:CreateRowInput(body, "Equip When KG Min ( Assumed at age 100 )", tostring(TAB_W_EQUIP_MIN[tabKey]), function(text)
+                local v = tonumber(text)
+                if v then
+                    TAB_W_EQUIP_MIN[tabKey] = v
+                    autoSave()
+                else
+                    warn(string.format("[AutoKG/%s] Equip W100 Min tidak valid: %s", tabKey, text))
+                end
+            end)
+
+            --------------------------------------------------------
+            -- 4) Unequip W100 Max
+            --------------------------------------------------------
+            ui:CreateRowInput(body, "Unequip When KG Max ( Assumed at age 100 )", tostring(TAB_W_UNEQUIP_MAX[tabKey]), function(text)
+                local v = tonumber(text)
+                if v then
+                    TAB_W_UNEQUIP_MAX[tabKey] = v
+                    autoSave()
+                else
+                    warn(string.format("[AutoKG/%s] Unequip W100 Max tidak valid: %s", tabKey, text))
+                end
+            end)
+            
+            --------------------------------------------------------
+-- GBXP: Max Equip
+--------------------------------------------------------
+if tabKey == "gbxp" then
+    GBXP_MAX_EQUIP = tonumber(GBXP_MAX_EQUIP) or 2
+
+    ui:CreateRowInput(body, "GBXP Max Equip", tostring(GBXP_MAX_EQUIP), function(text)
+        local v = tonumber(text)
+        if v then
+            -- clamp biar aman (optional)
+            if v < 1 then v = 1 end
+            if v > 8 then v = 8 end
+
+            GBXP_MAX_EQUIP = v
+            autoSave()
+
+            -- kalau kamu mau trigger refresh loop lain:
+            _G.__AUTOKG_DIRTY = true
+        else
+            warn("[AutoKG/gbxp] GBXP Max Equip tidak valid:", text)
+        end
+    end)
+end
+
+
+            --------------------------------------------------------
+            -- LIST: Daftar Pet untuk tab ini
+            --------------------------------------------------------
+            local listLabel
+            if tabKey == "gbxp" then
+                listLabel = "Select Pet GBXP (Non Favorite)"
+            elseif tabKey == "noos" then
+                listLabel = "Select Pet Elephant Team (Favorite List)"
+            elseif tabKey == "boost" then
+                listLabel = "Select Pet Mutation Team (Favorite List)"
+            elseif tabKey == "xp" then
+                listLabel = "Select Pet XP Team (Favorite List)"
+            elseif tabKey == "seratusage" then
+                listLabel = "Select Pet 100 Age Team (Favorite List)"
+            else
+                listLabel = "Select Pet"
+            end
+
+            local entries = {}
+            local okE, resE = pcall(function()
+                return PetListView.buildEntriesForTab(tabKey, selSet)
+            end)
+            if okE and type(resE) == "table" then
+                entries = resE
+            end
+
+            local _, listApi = ui:CreateRowList(body, listLabel, entries, function(key, on, label)
+                if on then
+                    selSet[key] = true
+                else
+                    selSet[key] = nil
+                end
+                autoSave()
+                refreshAllSummary()
+            end)
+
+            -- register list api untuk refresh
+            UIREF.tabs[tabKey] = {
+                listApi = listApi,
+                selSet  = selSet,
+            }
+
+            -- set selected awal
+            local preSelected = {}
+            for uuid, on in pairs(selSet) do
+                if on then preSelected[uuid] = true end
+            end
+            pcall(function()
+                listApi("setSelected", preSelected)
+            end)
+
+            -- refresh summary pertama kali
+            refreshAllSummary()
+
+            --------------------------------------------------------
+            -- Section open/close default
+            --------------------------------------------------------
+            if #sectionSetters == 1 then
+                sectionSetters[1](true)
+            else
+                for _, fn in ipairs(sectionSetters) do
+                    fn(false)
+                end
+            end
+        end, order)
+    end
+
+    ----------------------------------------------------------------
+    -- REGISTER SUB TAB TEAM
+    ----------------------------------------------------------------
+    buildAutoKGSubTab("noos",       "Elephant",  1)
+    buildAutoKGSubTab("boost",      "Mutation", 2)
+    buildAutoKGSubTab("seratusage", "100 Age",   3)
+    buildAutoKGSubTab("xp",         "XP",        4)
+    buildAutoKGSubTab("gbxp",       "GBXP",      5)
+
+    ----------------------------------------------------------------
+    -- SUB TAB: settingkg (âš™)
+    ----------------------------------------------------------------
+    ui:RegisterSubTab("autokg", "settingkg", "âš™", function()
+        ui:ClearSubContent()
+
+        local sectionSetters = {}
+        local function createSection(title)
+            local body, setExpanded = ui:CreateSection(title, true)
+            table.insert(sectionSetters, setExpanded)
+            return body
+        end
+
+        -- sync toggle mutation dari global yang di-load state.lua
+        if STATE.autokgMutationEnabled == nil then
+            STATE.autokgMutationEnabled = (AUTOKG_MUTATION_ENABLED == true)
+        end
+
+        if STATE.autoBoostEnabled == nil then
+            STATE.autoBoostEnabled = (AUTO_BOOST_ENABLED == true)
+        end
+
+        local body1 = createSection("Auto Shard Cleaner")
+        local body2 = createSection("Auto Boost")
+        local body3 = createSection(" Auto Feed (Fruit)")
+        local body4 = createSection("Auto Collect (Fruit)")
+
+        
+
+        ------------------------------------------------------
+        -- MUTATION DROPDOWN
+        ------------------------------------------------------
+        local mutationItems = {}
+        do
+            local mutList = {}
+            local ok, res = pcall(function()
+                return PetListView.listAllMutations()
+            end)
+            if ok and type(res) == "table" then
+                mutList = res
+            end
+
+            for _, mutName in ipairs(mutList) do
+                table.insert(mutationItems, { key = mutName, name = mutName })
+            end
+        end
+
+        ui:CreateRowDropdown(body1, {
+            label       = "Select Mutation to Maintain / Keep",
+            placeholder = "Select Mutation...",
+            mode        = "multi",
+            getItems    = function() return mutationItems end,
+            initial     = GBXP_MUT_SELECTED or {},
+            onChanged   = function(mode, selectedMap)
+                GBXP_MUT_SELECTED = {}
+                if type(selectedMap) == "table" then
+                    for mutName, on in pairs(selectedMap) do
+                        if on then
+                            GBXP_MUT_SELECTED[mutName] = true
+                        end
+                    end
+                end
+                autoSave()
+            end,
+        })
+
+        ui:CreateRowToggle(
+            body1,
+            "Auto Shard Cleaner ( Mutations not selected above will be Cleaned )",
+            STATE.autokgMutationEnabled,
+            function(isOn)
+                STATE.autokgMutationEnabled = isOn and true or false
+                AUTOKG_MUTATION_ENABLED     = STATE.autokgMutationEnabled
+
+                pcall(function()
+                    if _G.WorldShardCleaner and _G.WorldShardCleaner.setEnabled then
+                        _G.WorldShardCleaner:setEnabled(STATE.autokgMutationEnabled)
+                    end
+                end)
+
+                autoSave()
+            end
+        )
+
+        ------------------------------------------------------
+        -- AUTO BOOST (pet types + boost item)
+        ------------------------------------------------------
+        SELECTED_PET_TYPES = SELECTED_PET_TYPES or {}
+        PETBOOST_SELECTED  = PETBOOST_SELECTED  or {}
+
+        local PetItems = {}
+        local PetBoostItems = {}
+        pcall(function()
+            PetItems = PetListView.buildPetItems() or {}
+        end)
+        pcall(function()
+            PetBoostItems = PetListView.buildPetBoostItems() or {}
+        end)
+
+        ui:CreateRowDropdown(body2, {
+            label       = "Select Pet To Boost",
+            placeholder = "Select Pet...",
+            mode        = "multi",
+            getItems    = function() return PetItems end,
+            initial     = SELECTED_PET_TYPES or {},
+            onChanged   = function(mode, selectedMap)
+                SELECTED_PET_TYPES = {}
+                for petName, enabled in pairs(selectedMap or {}) do
+                    if enabled then
+                        SELECTED_PET_TYPES[petName] = true
+                    end
+                end
+                autoSave()
+            end,
+        })
+
+        ui:CreateRowDropdown(body2, {
+            label       = "Select Pet Boost Item",
+            placeholder = "Select Boost...",
+            mode        = "multi",
+            getItems    = function() return PetBoostItems end,
+            initial     = PETBOOST_SELECTED or {},
+            onChanged   = function(mode, selectedMap)
+                PETBOOST_SELECTED = {}
+                for uuid, enabled in pairs(selectedMap or {}) do
+                    if enabled then
+                        PETBOOST_SELECTED[uuid] = true -- simpan UUID saja
+                    end
+                end
+                autoSave()
+            end,
+        })
+    
+    
+ui:CreateRowInput(body2, "Delay Boost ( Sec )", tostring(AUTO_BOOST_DELAY or 20), function(text)
+    text = tostring(text or ""):gsub("%s+", "")
+    if text == "" then
+        return -- biarin, jangan spam warn saat user hapus lalu ketik lagi
+    end
+
+    local v = tonumber(text)
+    if not v or v <= 0 then
+        warn("[AutoBoost] Delay Boost tidak valid: " .. tostring(text))
+        return
+    end
+
+    -- optional: bulatkan biar delay rapi & konsisten
+    v = math.floor(v + 0.5)
+
+    AUTO_BOOST_DELAY = v
+    local G = (getgenv and getgenv()) or _G
+    G.AUTO_BOOST_DELAY = v
+
+    -- âœ… prioritas: setDelay (update tanpa restart)
+    local BoostModule = _G.AutoKGBoost
+    if BoostModule then
+        pcall(function()
+            if type(BoostModule.setDelay) == "function" then
+                BoostModule.setDelay(v)         -- kalau fungsi biasa (.)
+            elseif type(BoostModule.SetDelay) == "function" then
+                BoostModule.SetDelay(v)
+            elseif type(BoostModule.setDelay) == "function" then
+                BoostModule:setDelay(v)         -- kalau method (:)
+            elseif type(BoostModule.SetDelay) == "function" then
+                BoostModule:SetDelay(v)
+            else
+                -- fallback property
+                BoostModule.delay = v
+                BoostModule.DELAY = v
+            end
+        end)
+    end
+
+    -- âœ… autosave agak ditunda biar gak spam writefile pas ngetik
+    if ui and type(ui._boostDelaySaveDebounce) ~= "thread" then
+        -- nothing
+    end
+    task.defer(function()
+        -- debounce sederhana: tunggu sebentar, kalau nilainya masih sama baru save
+        local cur = v
+        task.wait(0.35)
+        if AUTO_BOOST_DELAY == cur then
+            autoSave()
+        end
+    end)
+end)
+
+
+
+        local BoostModule = _G.AutoKGBoost
+
+        ui:CreateRowToggle(
+            body2,
+            "Enable Auto Boost",
+            AUTO_BOOST_ENABLED == true,
+            function(isOn)
+                AUTO_BOOST_ENABLED = isOn and true or false
+
+                if BoostModule then
+                    if AUTO_BOOST_ENABLED and BoostModule.start then
+                        pcall(BoostModule.start)
+                    elseif (not AUTO_BOOST_ENABLED) and BoostModule.stop then
+                        pcall(BoostModule.stop)
+                    end
+                end
+
+                autoSave()
+            end
+        )
+
+
+-- ============================================================
+-- Auto Feed (body3)
+-- ============================================================
+
+-- default state
+AUTO_FEED_ENABLED          = (AUTO_FEED_ENABLED == true)
+AUTO_FEED_DELAY            = tonumber(AUTO_FEED_DELAY or 10) or 10
+AUTO_FEED_PETS_SELECTED    = AUTO_FEED_PETS_SELECTED or {}      -- map key->true (sesuai PetItems.key)
+AUTO_FEED_FRUITS_SELECTED  = AUTO_FEED_FRUITS_SELECTED or {}    -- map fruit->true
+
+local G = (getgenv and getgenv()) or _G
+G.AUTO_FEED_ENABLED = AUTO_FEED_ENABLED
+G.AUTO_FEED_DELAY   = AUTO_FEED_DELAY
+
+-- module optional (kalau sudah ada)
+local FeedModule = rawget(_G, "AutoFeed") or rawget(_G, "AutoKGFeed") or rawget(_G, "AutoKGAutoFeed")
+
+-- items fruit (sesuaikan nama sesuai game kamu)
+local function getAutoBuy()
+    local env = (getgenv and getgenv()) or _G
+    return env.AutoBuyModule or _G.AutoBuyModule
+end
+
+local function getSeedItemsForFruit()
+    local AutoBuy = getAutoBuy()
+    if not AutoBuy or type(AutoBuy.GetLists) ~= "function" then
+        warn("[AutoFeed UI] AutoBuyModule belum siap / GetLists() tidak ada")
+        return {}
+    end
+
+    local ok, seedList = pcall(function()
+        local a = AutoBuy.GetLists() -- returns SeedItems, EggItems, GearItems
+        return a
+    end)
+
+    if ok and type(seedList) == "table" then
+        return seedList
+    end
+
+    return {}
+end
+
+local function wrapStringList(list)
+    local out = {}
+    for _, name in ipairs(list or {}) do
+        out[#out+1] = { key = tostring(name), name = tostring(name) }
+    end
+    return out
+end
+
+local function cleanSelectedMap(selectedMap)
+    local out = {}
+    for k, v in pairs(selectedMap or {}) do
+        if v == true then out[tostring(k)] = true end
+    end
+    return out
+end
+
+-- 1) Dropdown Pet (multi)
+ui:CreateRowDropdown(body3, {
+    label       = "Select Pet To Feed",
+    placeholder = "Select Pet...",
+    mode        = "multi",
+    getItems    = function() return PetItems end,
+    initial     = AUTO_FEED_PETS_SELECTED or {},
+    onChanged   = function(mode, selectedMap)
+        AUTO_FEED_PETS_SELECTED = {}
+        for k, enabled in pairs(selectedMap or {}) do
+            if enabled then
+                AUTO_FEED_PETS_SELECTED[k] = true
+            end
+        end
+        G.AUTO_FEED_PETS_SELECTED = AUTO_FEED_PETS_SELECTED
+
+        -- optional sync ke module
+        pcall(function()
+            if FeedModule and type(FeedModule.setPets) == "function" then
+                FeedModule.setPets(AUTO_FEED_PETS_SELECTED)
+            elseif FeedModule and type(FeedModule.SetPets) == "function" then
+                FeedModule.SetPets(AUTO_FEED_PETS_SELECTED)
+            elseif FeedModule and type(FeedModule.syncFromState) == "function" then
+                FeedModule:syncFromState()
+            end
+        end)
+
+        autoSave()
+    end,
+})
+
+AUTO_FEED_FRUITS_SELECTED = cleanSelectedMap(AUTO_FEED_FRUITS_SELECTED or {})
+
+ui:CreateRowDropdown(body3, {
+    label       = "Select Fruit",
+    placeholder = "Select Fruit...",
+    mode        = "multi",
+    getItems    = function()
+        local SeedNames = getSeedItemsForFruit()
+        return wrapStringList(SeedNames)
+    end,
+    initial     = AUTO_FEED_FRUITS_SELECTED,
+    onChanged   = function(_, selectedMap)
+        AUTO_FEED_FRUITS_SELECTED = cleanSelectedMap(selectedMap)
+        G.AUTO_FEED_FRUITS_SELECTED = AUTO_FEED_FRUITS_SELECTED
+
+        -- optional sync ke module feed
+        pcall(function()
+            if FeedModule and type(FeedModule.setFruits) == "function" then
+                FeedModule.setFruits(AUTO_FEED_FRUITS_SELECTED)
+            elseif FeedModule and type(FeedModule.SetFruits) == "function" then
+                FeedModule.SetFruits(AUTO_FEED_FRUITS_SELECTED)
+            elseif FeedModule and type(FeedModule.syncFromState) == "function" then
+                FeedModule:syncFromState()
+            end
+        end)
+
+        autoSave()
+    end,
+})
+
+
+-- 3) Input Hunger Under (SKALA BESAR: contoh 60000)
+local function getFeed()
+    return rawget(_G, "AutoFeed") or rawget(_G, "AutoKGFeed")
+end
+
+ui:CreateRowInput(body3, "If Hunger Under", tostring(AUTO_FEED_HUNGER_UNDER or 60000), function(text)
+    text = tostring(text or ""):gsub("%s+", "")
+    if text == "" then return end
+
+    local v = tonumber(text)
+    if not v then
+        warn("[AutoFeed] Hunger Under tidak valid: " .. tostring(text))
+        return
+    end
+
+    v = math.floor(v + 0.5)
+
+    -- âœ… jangan clamp 1..100 (hunger kamu 0..60000)
+    -- pilih max sesuai kebutuhan (aku pakai 200000 biar aman)
+    v = math.clamp(v, 1, 200000)
+
+    AUTO_FEED_HUNGER_UNDER = v
+    local G = (getgenv and getgenv()) or _G
+    G.AUTO_FEED_HUNGER_UNDER = v
+
+    -- âœ… push realtime ke module yang aktif
+    pcall(function()
+        local Feed = getFeed()
+        if not Feed then return end
+
+        if type(Feed.setHungerUnder) == "function" then
+            Feed.setHungerUnder(v)
+        elseif type(Feed.SetHungerUnder) == "function" then
+            Feed.SetHungerUnder(v)
+        elseif type(Feed.syncFromState) == "function" then
+            Feed:syncFromState()
+        else
+            Feed.HUNGER_UNDER = v
+        end
+    end)
+
+    -- autosave (anti spam)
+    task.defer(function()
+        local cur = v
+        task.wait(0.35)
+        if AUTO_FEED_HUNGER_UNDER == cur then
+            autoSave()
+        end
+    end)
+end)
+
+
+
+
+-- 4) Toggle Enable Auto Feed
+ui:CreateRowToggle(
+    body3,
+    "Enable Auto Feed",
+    AUTO_FEED_ENABLED == true,
+    function(isOn)
+        AUTO_FEED_ENABLED = isOn and true or false
+        G.AUTO_FEED_ENABLED = AUTO_FEED_ENABLED
+
+        if FeedModule then
+            if AUTO_FEED_ENABLED and FeedModule.start then
+                pcall(FeedModule.start)
+            elseif (not AUTO_FEED_ENABLED) and FeedModule.stop then
+                pcall(FeedModule.stop)
+            elseif type(FeedModule.SetEnabled) == "function" then
+                pcall(function() FeedModule.SetEnabled(AUTO_FEED_ENABLED) end)
+            elseif type(FeedModule.setEnabled) == "function" then
+                pcall(function() FeedModule.setEnabled(AUTO_FEED_ENABLED) end)
+            end
+        end
+
+        autoSave()
+    end
+)
+
+
+
+
+ui:CreateRowToggle(
+    body4,
+    "Enable Auto Collect (Fruit)",
+    AUTO_COLLECT_FRUIT_ENABLED == true,
+    function(isOn)
+        AUTO_COLLECT_FRUIT_ENABLED = isOn and true or false
+        G.AUTO_COLLECT_FRUIT_ENABLED = AUTO_COLLECT_FRUIT_ENABLED
+
+        -- coba hidup/matikan module kalau ada
+        if AutoCollectFruit then
+            if AUTO_COLLECT_FRUIT_ENABLED and AutoCollectFruit.start then
+                pcall(AutoCollectFruit.start)
+            elseif (not AUTO_COLLECT_FRUIT_ENABLED) and AutoCollectFruit.stop then
+                pcall(AutoCollectFruit.stop)
+            elseif type(AutoCollectFruit.SetEnabled) == "function" then
+                pcall(function() AutoCollectFruit.SetEnabled(AUTO_COLLECT_FRUIT_ENABLED) end)
+            elseif type(AutoCollectFruit.setEnabled) == "function" then
+                pcall(function() AutoCollectFruit.setEnabled(AUTO_COLLECT_FRUIT_ENABLED) end)
+            end
+        end
+
+        autoSave()
+    end
+)
+
+
+----------------------------------------------------------------
+-- Swap Skill Config (SAVE/LOAD via GLOBAL swap_skill)
+-- âœ… Source of truth: (getgenv() or _G).swap_skill
+-- âœ… UI baca/tulis SS (swap_skill)
+-- âœ… autoSave() harus simpan GLOBAL swap_skill (pastikan state.lua kamu memang baca global ini)
+-- âœ… Push realtime ke module (SwapSkillModule / SwapSkill) kalau ada
+----------------------------------------------------------------
+
+local function BuildSwapSkillConfig(ui, bodyParent, STATE, PetListView, autoSave)
+    local G = (getgenv and getgenv()) or _G
+
+    ----------------------------------------------------------------
+    -- SOURCE OF TRUTH (GLOBAL)
+    ----------------------------------------------------------------
+    local swap_skill = rawget(G, "swap_skill") or rawget(_G, "swap_skill")
+    if type(swap_skill) ~= "table" then
+        swap_skill = {
+            enabled      = false,
+            selected     = {},
+            order        = {},
+            delays       = {},
+            poll         = 0.05,
+            scanInterval = 0.1,
+        }
+    end
+    G.swap_skill = swap_skill
+    _G.swap_skill = swap_skill
+
+    local SS = swap_skill
+
+    -- normalize types (jangan overwrite keras)
+    SS.enabled      = (SS.enabled == true)
+    SS.selected     = (type(SS.selected) == "table") and SS.selected or {}
+    SS.order        = (type(SS.order)    == "table") and SS.order    or {}
+    SS.delays       = (type(SS.delays)   == "table") and SS.delays   or {}
+    SS.scanInterval = tonumber(SS.scanInterval) or 0.1
+    SS.poll         = tonumber(SS.poll) or 0.05
+
+    ----------------------------------------------------------------
+    -- helpers
+    ----------------------------------------------------------------
+    local function _normUUID(u)
+        if u == nil then return nil end
+        local s = tostring(u)
+        local core = s:match("{?([0-9a-fA-F%-]+)}?") or s
+        if core == "" then return nil end
+        return "{" .. core .. "}"
+    end
+
+    local function toNumFloat(text)
+        text = tostring(text or ""):gsub("%s+", "")
+        if text == "" then return nil end
+        text = text:gsub(",", ".")
+        return tonumber(text)
+    end
+
+    local function norm(s)
+        s = tostring(s or ""):lower()
+        s = s:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+        return s
+    end
+
+    local function ensureDelay(uuid)
+        uuid = _normUUID(uuid)
+        if not uuid then return nil end
+        local d = SS.delays[uuid]
+        if type(d) ~= "table" then
+            d = { unequipAfterReady = 0.6, equipNext = 0 }
+            SS.delays[uuid] = d
+        end
+        d.unequipAfterReady = tonumber(d.unequipAfterReady) or 0.6
+        d.equipNext         = tonumber(d.equipNext) or 0
+        return d
+    end
+
+    local function ensureOrderUnique(uuid)
+        uuid = _normUUID(uuid)
+        if not uuid then return end
+        for i = #SS.order, 1, -1 do
+            if SS.order[i] == uuid then
+                table.remove(SS.order, i)
+            end
+        end
+        table.insert(SS.order, 1, uuid)
+    end
+
+    local function getSwapPetEntries()
+        -- ambil dari petList main_pet (agar sesuai flow kamu)
+        local ok, entries = pcall(function()
+            return PetListView.buildEntriesForTab("noos", STATE.main_pet and STATE.main_pet.selected or {})
+        end)
+        if ok and type(entries) == "table" then return entries end
+        return {}
+    end
+
+    -- apply helper (Start/Stop module)
+    local function applySwapSkillModule(reason)
+        local GG = (getgenv and getgenv()) or _G
+        local Mod = GG.SwapSkillModule or GG.SwapSkill or _G.SwapSkillModule or _G.SwapSkill
+        if not Mod then return end
+
+        local function callMaybe(obj, method, ...)
+            local f = obj and obj[method]
+            if type(f) ~= "function" then return false end
+            local args = table.pack(...)
+            if pcall(function() f(obj, table.unpack(args, 1, args.n)) end) then return true end
+            return pcall(function() f(table.unpack(args, 1, args.n)) end)
+        end
+
+        local hasAny = (SS.selected and next(SS.selected) ~= nil)
+
+        if SS.enabled and hasAny then
+            callMaybe(Mod, "SyncFromState"); callMaybe(Mod, "syncFromState")
+            callMaybe(Mod, "Start");        callMaybe(Mod, "start")
+        else
+            callMaybe(Mod, "Stop", reason or "ui"); callMaybe(Mod, "stop", reason or "ui")
+        end
+    end
+
+    -- UI mini helpers
+    local function mkCorner(p, r)
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, r or 6)
+        c.Parent = p
+    end
+    local function mkStroke(p, col, th, tr)
+        local s = Instance.new("UIStroke")
+        s.Color = col or Color3.fromRGB(40,40,40)
+        s.Thickness = th or 1
+        s.Transparency = tr or 0.5
+        s.Parent = p
+    end
+    local function mkPad(p, l, r, t, b)
+        local pad = Instance.new("UIPadding")
+        pad.PaddingTop    = UDim.new(0, t or 4)
+        pad.PaddingBottom = UDim.new(0, b or 4)
+        pad.PaddingLeft   = UDim.new(0, l or 4)
+        pad.PaddingRight  = UDim.new(0, r or 4)
+        pad.Parent = p
+    end
+
+    ----------------------------------------------------------------
+    -- WRAP
+    ----------------------------------------------------------------
+    local wrap = Instance.new("Frame")
+    wrap.Name = "SwapSkillWrap"
+    wrap.Parent = bodyParent
+    wrap.BackgroundTransparency = 1
+    wrap.Size = UDim2.new(1,0,0,0)
+    wrap.AutomaticSize = Enum.AutomaticSize.Y
+
+    local ROW_H = 26
+    local GAP   = 6
+
+    ----------------------------------------------------------------
+    -- SCAN INTERVAL (row 1)
+    ----------------------------------------------------------------
+    local intervalWrap = Instance.new("Frame")
+    intervalWrap.Name = "IntervalWrap"
+    intervalWrap.Parent = wrap
+    intervalWrap.BackgroundColor3 = Color3.fromRGB(22,22,22)
+    intervalWrap.BorderSizePixel = 0
+    intervalWrap.Size = UDim2.new(1, 0, 0, ROW_H)
+    intervalWrap.Position = UDim2.new(0, 0, 0, 0)
+    mkCorner(intervalWrap, 4); mkStroke(intervalWrap); mkPad(intervalWrap, 6, 6, 0, 0)
+
+    local intervalLbl = Instance.new("TextLabel")
+    intervalLbl.Parent = intervalWrap
+    intervalLbl.BackgroundTransparency = 1
+    intervalLbl.Size = UDim2.new(1, -90, 1, 0)
+    intervalLbl.Font = Enum.Font.Gotham
+    intervalLbl.TextSize = 12
+    intervalLbl.TextXAlignment = Enum.TextXAlignment.Left
+    intervalLbl.TextColor3 = Color3.fromRGB(235,235,235)
+    intervalLbl.Text = "Scan Interval"
+
+    local intervalBox = Instance.new("TextBox")
+    intervalBox.Name = "ScanInterval"
+    intervalBox.Parent = intervalWrap
+    intervalBox.BackgroundColor3 = Color3.fromRGB(10,10,10)
+    intervalBox.BorderSizePixel = 0
+    intervalBox.Size = UDim2.new(0, 78, 0, 22)
+    intervalBox.Position = UDim2.new(1, -78, 0.5, -11)
+    intervalBox.Font = Enum.Font.Gotham
+    intervalBox.TextSize = 12
+    intervalBox.TextColor3 = Color3.fromRGB(235,235,235)
+    intervalBox.TextXAlignment = Enum.TextXAlignment.Center
+    intervalBox.ClearTextOnFocus = false
+    intervalBox.Text = tostring(SS.scanInterval or 0.1)
+    mkCorner(intervalBox, 4); mkStroke(intervalBox, Color3.fromRGB(40,40,40), 1, 0.6)
+
+    intervalBox.FocusLost:Connect(function()
+        local n = toNumFloat(intervalBox.Text)
+        if not n or n <= 0 then
+            intervalBox.Text = tostring(SS.scanInterval or 0.1)
+            return
+        end
+
+        SS.scanInterval = n
+        intervalBox.Text = tostring(n)
+
+        -- mirror global + save
+        G.swap_skill = SS
+        _G.swap_skill = SS
+        autoSave()
+
+        -- apply
+        applySwapSkillModule("ui_interval")
+
+        -- push realtime ke module (kalau module punya setter)
+        pcall(function()
+            local GG = (getgenv and getgenv()) or _G
+            local Mod = GG.SwapSkillModule or GG.SwapSkill or _G.SwapSkillModule or _G.SwapSkill
+            if not Mod then return end
+            if type(Mod.SetScanInterval) == "function" then
+                Mod:SetScanInterval(n)
+            elseif type(Mod.setScanInterval) == "function" then
+                Mod.setScanInterval(n)
+            end
+            pcall(function()
+                Mod.SCAN_INTERVAL = n
+                Mod.scanInterval  = n
+            end)
+        end)
+    end)
+
+    ----------------------------------------------------------------
+    -- ENABLE (row 2)
+    ----------------------------------------------------------------
+    local enableWrap = Instance.new("Frame")
+    enableWrap.Name = "EnableWrap"
+    enableWrap.Parent = wrap
+    enableWrap.BackgroundColor3 = Color3.fromRGB(22,22,22)
+    enableWrap.BorderSizePixel = 0
+    enableWrap.Size = UDim2.new(1, 0, 0, ROW_H)
+    enableWrap.Position = UDim2.new(0, 0, 0, (ROW_H + GAP))
+    mkCorner(enableWrap, 4); mkStroke(enableWrap); mkPad(enableWrap, 6, 6, 0, 0)
+
+    local enableLbl = Instance.new("TextLabel")
+    enableLbl.Parent = enableWrap
+    enableLbl.BackgroundTransparency = 1
+    enableLbl.Size = UDim2.new(1, -70, 1, 0)
+    enableLbl.Font = Enum.Font.Gotham
+    enableLbl.TextSize = 12
+    enableLbl.TextXAlignment = Enum.TextXAlignment.Left
+    enableLbl.TextColor3 = Color3.fromRGB(235,235,235)
+    enableLbl.Text = "Enable Swap Skill"
+
+    local enableBtn = Instance.new("TextButton")
+    enableBtn.Parent = enableWrap
+    enableBtn.BackgroundColor3 = Color3.fromRGB(10,10,10)
+    enableBtn.BorderSizePixel = 0
+    enableBtn.Size = UDim2.new(0, 58, 0, 22)
+    enableBtn.Position = UDim2.new(1, -58, 0.5, -11)
+    enableBtn.Font = Enum.Font.GothamBold
+    enableBtn.TextSize = 12
+    enableBtn.TextColor3 = Color3.fromRGB(235,235,235)
+    mkCorner(enableBtn, 4); mkStroke(enableBtn, Color3.fromRGB(40,40,40), 1, 0.6)
+
+    local function renderEnable()
+        local on = (SS.enabled == true)
+        enableBtn.Text = on and "ON" or "OFF"
+        enableBtn.TextColor3 = on and Color3.fromRGB(255,217,0) or Color3.fromRGB(235,235,235)
+    end
+    renderEnable()
+
+    enableBtn.MouseButton1Click:Connect(function()
+        SS.enabled = not (SS.enabled == true)
+        renderEnable()
+
+        G.swap_skill = SS
+        _G.swap_skill = SS
+        autoSave()
+
+        applySwapSkillModule("ui_enable")
+    end)
+
+    ----------------------------------------------------------------
+    -- SEARCH (row 3)
+    ----------------------------------------------------------------
+    local TOP_Y = (ROW_H + GAP) * 2 -- interval + enable
+
+    local searchWrap = Instance.new("Frame")
+    searchWrap.Name = "SearchWrap"
+    searchWrap.Parent = wrap
+    searchWrap.BackgroundColor3 = Color3.fromRGB(22,22,22)
+    searchWrap.BorderSizePixel = 0
+    searchWrap.Position = UDim2.new(0, 0, 0, TOP_Y)
+    searchWrap.Size = UDim2.new(1, 0, 0, 26)
+    mkCorner(searchWrap, 4); mkStroke(searchWrap); mkPad(searchWrap, 6, 6, 0, 0)
+
+    local searchBox = Instance.new("TextBox")
+    searchBox.Name = "Search"
+    searchBox.Parent = searchWrap
+    searchBox.BackgroundTransparency = 1
+    searchBox.Size = UDim2.new(1,0,1,0)
+    searchBox.Font = Enum.Font.Gotham
+    searchBox.TextSize = 12
+    searchBox.TextColor3 = Color3.fromRGB(235,235,235)
+    searchBox.TextXAlignment = Enum.TextXAlignment.Center
+    searchBox.ClearTextOnFocus = false
+    searchBox.Text = ""
+
+    local searchHint = Instance.new("TextLabel")
+    searchHint.Name = "SearchHint"
+    searchHint.Parent = searchWrap
+    searchHint.BackgroundTransparency = 1
+    searchHint.Size = UDim2.new(1, 0, 1, 0)
+    searchHint.Font = Enum.Font.Gotham
+    searchHint.TextSize = 12
+    searchHint.TextColor3 = Color3.fromRGB(150,150,150)
+    searchHint.TextXAlignment = Enum.TextXAlignment.Center
+    searchHint.Text = "Search pet name..."
+    searchHint.ZIndex = (searchBox.ZIndex or 1) + 1
+
+    local function updateSearchHint()
+        local t = tostring(searchBox.Text or "")
+        searchHint.Visible = (t == "")
+    end
+    updateSearchHint()
+    searchBox:GetPropertyChangedSignal("Text"):Connect(updateSearchHint)
+    searchBox.Focused:Connect(updateSearchHint)
+    searchBox.FocusLost:Connect(updateSearchHint)
+
+    ----------------------------------------------------------------
+    -- HEADER KOLOM (row 4)
+    ----------------------------------------------------------------
+    local headerH = 22
+    local header = Instance.new("Frame")
+    header.Name = "SwapSkillHeader"
+    header.Parent = wrap
+    header.BackgroundColor3 = Color3.fromRGB(18,18,18)
+    header.BorderSizePixel = 0
+    header.Position = UDim2.new(0,0,0, TOP_Y + 26 + GAP)
+    header.Size = UDim2.new(1,0,0, headerH)
+    mkCorner(header, 6); mkStroke(header); mkPad(header, 6,6,0,0)
+
+    local function mkHead(text, posUDim2, sizeUDim2, align)
+        local t = Instance.new("TextLabel")
+        t.Parent = header
+        t.BackgroundTransparency = 1
+        t.Position = posUDim2
+        t.Size = sizeUDim2
+        t.Font = Enum.Font.GothamBold
+        t.TextSize = 11
+        t.TextColor3 = Color3.fromRGB(170,170,170)
+        t.TextXAlignment = align or Enum.TextXAlignment.Left
+        t.Text = text
+        return t
+    end
+
+    local BOX_W      = 52
+    local BOX_GAP    = 9
+    local HEAD_SHIFT = 8
+
+    mkHead("Status", UDim2.new(0, 0, 0, 0), UDim2.new(0, 34, 1, 0), Enum.TextXAlignment.Center)
+
+    local PET_RIGHT = (BOX_W + BOX_GAP + BOX_W) + HEAD_SHIFT + 8
+    mkHead("PET", UDim2.new(0, 40, 0, 0), UDim2.new(1, -(40 + PET_RIGHT), 1, 0), Enum.TextXAlignment.Center)
+
+    mkHead("Pickup", UDim2.new(1, -(BOX_W + BOX_GAP + BOX_W) - HEAD_SHIFT, 0, 0), UDim2.new(0, BOX_W, 1, 0), Enum.TextXAlignment.Center)
+    mkHead("Equip",  UDim2.new(1, -(BOX_W) - HEAD_SHIFT,              0, 0), UDim2.new(0, BOX_W, 1, 0), Enum.TextXAlignment.Center)
+
+    ----------------------------------------------------------------
+    -- SCROLL LIST (row 5)
+    ----------------------------------------------------------------
+    local ROW_ITEM_H, ROW_PAD, VISIBLE_ROWS = 28, 6, 6
+    local function calcListHeight(count)
+        local rows = math.min(count or 0, VISIBLE_ROWS)
+        if rows <= 0 then rows = 1 end
+        return (rows * ROW_ITEM_H) + ((rows - 1) * ROW_PAD) + 10 + 10
+    end
+
+    local sf = Instance.new("ScrollingFrame")
+    sf.Name = "SwapSkillList"
+    sf.Parent = wrap
+    sf.BackgroundColor3 = Color3.fromRGB(15,15,15)
+    sf.BorderSizePixel = 0
+    sf.Position = UDim2.new(0,0,0, (TOP_Y + 26 + GAP) + headerH + GAP)
+    sf.Size = UDim2.new(1,0,0,calcListHeight(0))
+    sf.ScrollBarThickness = 0
+    sf.ScrollBarImageTransparency = 1
+    sf.ScrollingDirection = Enum.ScrollingDirection.Y
+    sf.AutomaticCanvasSize = Enum.AutomaticSize.None
+    sf.ClipsDescendants = true
+    mkCorner(sf, 6); mkStroke(sf); mkPad(sf, 6,6,10,10)
+
+    local layout = Instance.new("UIListLayout")
+    layout.Parent = sf
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, ROW_PAD)
+
+    local function clearRows()
+        for _, ch in ipairs(sf:GetChildren()) do
+            if ch:IsA("Frame") and ch.Name:sub(1,5) == "Item_" then
+                ch:Destroy()
+            end
+            if ch:IsA("TextLabel") and ch.Name == "EmptyHint" then
+                ch:Destroy()
+            end
+        end
+    end
+
+    local function buildRow(i, entry)
+        local uuid = _normUUID(entry.uuid or entry.key or entry.id or entry.UUID)
+        if not uuid then return end
+
+        local name = tostring(entry.name or entry.label or uuid)
+        local d = ensureDelay(uuid)
+
+        local item = Instance.new("Frame")
+        item.Name = "Item_"..uuid
+        item.Parent = sf
+        item.BackgroundColor3 = Color3.fromRGB(22,22,22)
+        item.Size = UDim2.new(1,0,0,ROW_ITEM_H)
+        item.LayoutOrder = i
+        mkCorner(item, 4)
+        mkPad(item, 6,6,0,0)
+
+        local tog = Instance.new("TextButton")
+        tog.Parent = item
+        tog.BackgroundColor3 = Color3.fromRGB(10,10,10)
+        tog.BorderSizePixel = 0
+        tog.Size = UDim2.new(0, 34, 0, 22)
+        tog.Position = UDim2.new(0, 0, 0.5, -11)
+        tog.Font = Enum.Font.GothamBold
+        tog.TextSize = 12
+        tog.TextColor3 = Color3.fromRGB(235,235,235)
+        mkCorner(tog, 4); mkStroke(tog, Color3.fromRGB(40,40,40), 1, 0.6)
+
+        local nameLbl = Instance.new("TextLabel")
+        nameLbl.Parent = item
+        nameLbl.BackgroundTransparency = 1
+        nameLbl.Position = UDim2.new(0, 40, 0, 0)
+        nameLbl.Size = UDim2.new(1, -260, 1, 0)
+        nameLbl.Font = Enum.Font.Gotham
+        nameLbl.TextSize = 12
+        nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+        nameLbl.TextColor3 = Color3.fromRGB(235,235,235)
+        nameLbl.Text = name
+
+        local boxUnequip = Instance.new("TextBox")
+        boxUnequip.Parent = item
+        boxUnequip.BackgroundColor3 = Color3.fromRGB(10,10,10)
+        boxUnequip.BorderSizePixel = 0
+        boxUnequip.Size = UDim2.new(0, BOX_W, 0, 22)
+        boxUnequip.Position = UDim2.new(1, -(BOX_W + BOX_GAP + BOX_W), 0.5, -11)
+        boxUnequip.Font = Enum.Font.Gotham
+        boxUnequip.TextSize = 12
+        boxUnequip.TextColor3 = Color3.fromRGB(235,235,235)
+        boxUnequip.TextXAlignment = Enum.TextXAlignment.Center
+        boxUnequip.ClearTextOnFocus = false
+        boxUnequip.Text = tostring(d.unequipAfterReady)
+        mkCorner(boxUnequip, 4); mkStroke(boxUnequip, Color3.fromRGB(40,40,40), 1, 0.6)
+
+        local boxEquip = Instance.new("TextBox")
+        boxEquip.Parent = item
+        boxEquip.BackgroundColor3 = Color3.fromRGB(10,10,10)
+        boxEquip.BorderSizePixel = 0
+        boxEquip.Size = UDim2.new(0, BOX_W, 0, 22)
+        boxEquip.Position = UDim2.new(1, -(BOX_W), 0.5, -11)
+        boxEquip.Font = Enum.Font.Gotham
+        boxEquip.TextSize = 12
+        boxEquip.TextColor3 = Color3.fromRGB(235,235,235)
+        boxEquip.TextXAlignment = Enum.TextXAlignment.Center
+        boxEquip.ClearTextOnFocus = false
+        boxEquip.Text = tostring(d.equipNext)
+        mkCorner(boxEquip, 4); mkStroke(boxEquip, Color3.fromRGB(40,40,40), 1, 0.6)
+
+        local function renderToggle()
+            local on = (SS.selected[uuid] == true)
+            tog.Text = on and "ON" or "OFF"
+            tog.TextColor3 = on and Color3.fromRGB(255,217,0) or Color3.fromRGB(235,235,235)
+        end
+        renderToggle()
+
+        tog.MouseButton1Click:Connect(function()
+            local wantOn = not (SS.selected[uuid] == true)
+
+            if wantOn then
+                SS.selected[uuid] = true
+                ensureOrderUnique(uuid)
+                ensureDelay(uuid)
+                if SS.enabled ~= true then
+                    SS.enabled = true
+                    renderEnable()
+                end
+            else
+                SS.selected[uuid] = nil
+                if next(SS.selected) == nil then
+                    SS.enabled = false
+                    renderEnable()
+                end
+            end
+
+            renderToggle()
+
+            -- mirror + save
+            G.swap_skill = SS
+            _G.swap_skill = SS
+            autoSave()
+
+            applySwapSkillModule("ui_select")
+        end)
+
+        boxUnequip.FocusLost:Connect(function()
+            local n = toNumFloat(boxUnequip.Text)
+            if not n or n < 0 then
+                boxUnequip.Text = tostring(d.unequipAfterReady)
+                return
+            end
+            d.unequipAfterReady = n
+            ensureOrderUnique(uuid)
+
+            G.swap_skill = SS
+            _G.swap_skill = SS
+            autoSave()
+
+            applySwapSkillModule("ui_delay")
+        end)
+
+        boxEquip.FocusLost:Connect(function()
+            local n = toNumFloat(boxEquip.Text)
+            if not n or n < 0 then
+                boxEquip.Text = tostring(d.equipNext)
+                return
+            end
+            d.equipNext = n
+            ensureOrderUnique(uuid)
+
+            G.swap_skill = SS
+            _G.swap_skill = SS
+            autoSave()
+
+            applySwapSkillModule("ui_delay")
+        end)
+    end
+
+    local function refreshSwapList()
+        clearRows()
+
+        local q = norm(searchBox.Text)
+        local entries = getSwapPetEntries()
+
+        local shown = 0
+        for _, e in ipairs(entries) do
+            local nm = tostring(e.name or e.label or "")
+            if q == "" or norm(nm):find(q,1,true) then
+                shown += 1
+                buildRow(shown, e)
+            end
+        end
+
+        if shown == 0 then
+            local t = Instance.new("TextLabel")
+            t.Name = "EmptyHint"
+            t.Parent = sf
+            t.BackgroundTransparency = 1
+            t.Size = UDim2.new(1,0,0,22)
+            t.Font = Enum.Font.Gotham
+            t.TextSize = 12
+            t.TextXAlignment = Enum.TextXAlignment.Left
+            t.TextColor3 = Color3.fromRGB(170,170,170)
+            t.Text = (q ~= "") and "No match." or "No pets."
+        end
+
+        sf.Size = UDim2.new(1,0,0,calcListHeight(shown))
+        if shown > VISIBLE_ROWS then
+            sf.ScrollBarThickness = 6
+            sf.ScrollBarImageTransparency = 0
+        else
+            sf.ScrollBarThickness = 0
+            sf.ScrollBarImageTransparency = 1
+            sf.CanvasPosition = Vector2.new(0,0)
+        end
+
+        task.defer(function()
+            local h = layout.AbsoluteContentSize.Y
+            local pad = sf:FindFirstChildOfClass("UIPadding")
+            local top = pad and pad.PaddingTop.Offset or 0
+            local bot = pad and pad.PaddingBottom.Offset or 0
+            sf.CanvasSize = UDim2.new(0, 0, 0, h + top + bot)
+        end)
+    end
+
+    searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+        task.defer(refreshSwapList)
+    end)
+
+    refreshSwapList()
+end
+
+----------------------------------------------------------------
+-- CARA PAKAI (contoh)
+----------------------------------------------------------------
+local body5 = createSection("Swap Skill Config")
+BuildSwapSkillConfig(ui, body5, STATE, PetListView, autoSave)
+
+
+        if #sectionSetters == 1 then
+            sectionSetters[1](true)
+        else
+            for _, fn in ipairs(sectionSetters) do
+                fn(false)
+            end
+        end
+    end, 6)
+
+    ----------------------------------------------------------------
+    -- FOOTER: Mode Picker + Start/Stop
+    ----------------------------------------------------------------
+    -- pastikan default global
+    GBXP_STAGE_MODE = GBXP_STAGE_MODE or "auto"
+
+local function isAutoKGRunning()
+    local loop = rawget(_G, "AutoKGLoop")
+    if not loop then return false end
+    if type(loop.IsRunning) == "function" then
+        local ok, v = pcall(loop.IsRunning)
+        if ok then return v == true end
+    end
+    return loop.running == true
+end
+
+
+    local function getEffectiveModeId()
+        local m = GBXP_STAGE_MODE
+        if not m or m == "" then m = "auto" end
+        return m
+    end
+
+    local function getModeOptionsDynamic()
+        -- Ambil batas dari tab noos untuk label yang selalu up-to-date
+        local MODE_AGE_LIMIT = tonumber(TAB_AGE_EQUIP_MIN.noos) or 40
+        local MODE_KG_LIMIT  = tonumber(TAB_W_EQUIP_MIN.noos) or 60.45
+        MODE_KG_LIMIT = math.abs(MODE_KG_LIMIT)
+
+        return {
+            { id = "auto", label = "AUTO  -  Aâ†’Bâ†’Câ†’D otomatis" },
+            { id = "A",    label = "Stage A  -  Cari mutasi (Pilih mutasi di tab âš™)" },
+            { id = "B",    label = "Stage B  -  Up Age ke 40" },
+            {
+                id = "C",
+                label = string.format("Stage C  -  Up KG (Age â‰¥ %.0f & KG < %.2f) ðŸ˜", MODE_AGE_LIMIT, MODE_KG_LIMIT),
+            },
+            {
+                id = "D",
+                label = string.format("Stage D  -  Up Age sampai 100 (KG â‰¥ %.2f)", MODE_KG_LIMIT),
+            },
+            {
+                id = "BC",
+                label = string.format("Stage B + C  -  Age < %.0f & Age â‰¥ %.0f (KG < %.2f)", MODE_AGE_LIMIT, MODE_AGE_LIMIT, MODE_KG_LIMIT),
+            },
+            {
+                id = "CD",
+                label = string.format("Stage C + D  -  KG < %.2f & KG â‰¥ %.2f s/d Age 100", MODE_KG_LIMIT, MODE_KG_LIMIT),
+            },
+            {
+                id = "CAD",
+                label = string.format(
+                    "Stage C â†’ A â†’ D  -  Prioritas C (Age â‰¥ %.0f & KG < %.2f), lalu A (cari mutasi), lalu D (KG â‰¥ %.2f s/d Age 100)",
+                    MODE_AGE_LIMIT, MODE_KG_LIMIT, MODE_KG_LIMIT
+                ),
+            },
+        }
+    end
+
+    local function getModeButtonText()
+        return "Mode: " .. tostring(getEffectiveModeId())
+    end
+    
+    
+
+ -- ==================================================
+-- FOOTER AUTO KG (FULL)
+-- ==================================================
+local function refreshFooter()
+    local running = isAutoKGRunning()
+    local MODE_OPTIONS = getModeOptionsDynamic()
+
+    ui:SetFooterButtonsFor("autokg", {
+
+        -- MODE PICKER
+        {
+            text  = getModeButtonText(),
+            kind  = "normal",
+            order = 3,
+            onClick = function()
+                ui:OpenModePicker(MODE_OPTIONS, getEffectiveModeId(), function(newId)
+                    if type(setGBXPStageMode) == "function" then
+                        setGBXPStageMode(newId)
+                    else
+                        GBXP_STAGE_MODE = newId
+                    end
+
+                    autoSave()
+                    _G.__AUTOKG_DIRTY = true
+                    refreshFooter()
+                end)
+            end,
+        },
+
+        -- START KG
+        {
+            key     = "autokg_start",
+            text    = running and "âš¡ RUNNING." or "âš¡ START KG",
+            kind    = "normal",
+            running = running,
+            order   = 1,
+
+            onClick = function()
+                -- âœ… user klik START = buka manual-stop lock
+                _G.__AUTOKG_MANUAL_STOP = false
+                -- âœ… kalau sebelumnya ada autostart inflight (PSReconnect/qtp), lepas
+                _G.__AUTOKG_AUTOSTART_INFLIGHT = false
+
+                -- âœ… jangan double-start kalau sudah running
+                if isAutoKGRunning() then
+                    _G.__AUTOKG_DIRTY = true
+                    refreshFooter()
+                    return
+                end
+
+                local modeId = getEffectiveModeId()
+
+                -- simpan mode + reset stage biar konsisten
+                if type(setGBXPStageMode) == "function" then
+                    setGBXPStageMode(modeId)
+                else
+                    GBXP_STAGE_MODE = modeId
+                end
+
+                -- start loop
+                local loop = rawget(_G, "AutoKGLoop")
+                if loop and type(loop.Start) == "function" then
+                    pcall(function()
+                        loop.Start(modeId)
+                    end)
+                end
+
+                autoSave()
+                _G.__AUTOKG_DIRTY = true
+                refreshFooter()
+            end,
+
+            onReady = function(btn)
+                -- biar kerasa â€œelectricâ€
+                if isAutoKGRunning() then
+                    btn.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+                    btn.TextColor3       = Color3.fromRGB(255, 217, 0)
+                else
+                    btn.BackgroundColor3 = COLOR_PANEL
+                    btn.TextColor3       = COLOR_WHITE
+                end
+            end,
+        },
+
+        -- STOP
+        {
+            text  = "STOP",
+            kind  = "normal",
+            order = 2,
+
+            onClick = function()
+                -- âœ… user klik STOP = kunci supaya autostart (PSReconnect/qtp/main) gak nyalain lagi
+                _G.__AUTOKG_MANUAL_STOP = true
+
+                local loop = rawget(_G, "AutoKGLoop")
+                if loop and type(loop.Stop) == "function" then
+                    pcall(function()
+                        loop.Stop("manual")
+                    end)
+                end
+
+                autoSave()
+                _G.__AUTOKG_DIRTY = true
+                refreshFooter()
+            end,
+        },
+
+    })
+end
+
+-- initial build
+refreshFooter()
+
+-- watcher 1: fast dirty signal
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        if _G.__AUTOKG_DIRTY then
+            _G.__AUTOKG_DIRTY = false
+            pcall(refreshFooter)
+        end
+    end
+end)
+
+-- watcher 2: polling running/mode changes
+task.spawn(function()
+    local lastRunning, lastMode = nil, nil
+    while true do
+        task.wait(1.5)
+
+        local nowRunning = isAutoKGRunning()
+        local nowMode    = getEffectiveModeId()
+
+        if nowRunning ~= lastRunning or nowMode ~= lastMode or _G.__AUTOKG_DIRTY then
+            _G.__AUTOKG_DIRTY = false
+            lastRunning, lastMode = nowRunning, nowMode
+            pcall(refreshFooter)
+        end
+    end
+end)
+
+
+    ----------------------------------------------------------------
+    -- AUTO SYNC LOOP (summary + gbxp reconcile + list refresh)
+    ----------------------------------------------------------------
+    if STATE._autokgSyncStarted ~= true then
+        STATE._autokgSyncStarted = true
+
+        task.spawn(function()
+            while true do
+                -- 1) reconcile gbxp candidates (auto select)
+                reconcileGBXP()
+
+                -- 2) summary global selalu update (aman, ringan)
+                refreshAllSummary()
+                
+                if _G.__AUTOKG_DIRTY then
+    _G.__AUTOKG_DIRTY = false
+    refreshAllSummary()
+    refreshTabList("noos")
+    refreshTabList("boost")
+    refreshTabList("seratusage")
+    refreshTabList("xp")
+    refreshTabList("gbxp")
+end
+
+
+                -- 3) optional: refresh list tab lain yang sedang kebuka
+                -- (kalau tab belum pernah dibuka, UIREF.tabs[tabKey] belum ada â†’ aman)
+                -- refreshTabList("noos")
+                -- refreshTabList("boost")
+                -- refreshTabList("seratusage")
+                -- refreshTabList("xp")
+                -- gbxp sudah di-refresh saat reconcile berubah
+
+                task.wait(4)
+            end
+        end)
+    end
+end
+
+return M

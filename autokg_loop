@@ -1,0 +1,2100 @@
+-- autokg_loop.lua
+-- Loop utama AutoKG / GBXP (Stage A/B/C/D + NOOS/XP/BOOST/AGE support)
+-- Dibungkus module dengan Start/Stop, diexpose ke _G.AutoKGLoop
+-- === SINGLETON GUARD (WAJIB) ===
+if rawget(_G, "AutoKGLoop") and type(_G.AutoKGLoop) == "table" then
+    local old = _G.AutoKGLoop
+    if type(old.Start) == "function" and type(old.Stop) == "function" and type(old.IsRunning) == "function" then
+        return old
+    end
+end
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- ðŸ”¹ GLOBAL ENV
+local G = (getgenv and getgenv()) or _G
+
+------------------------------------------------------------
+-- DEPENDENCY (diasumsikan sudah ada di environment-mu)
+------------------------------------------------------------
+-- Harus ada di luar:
+--   ActivePetsService
+--   PetUtilities
+--   PetRegistry
+--   GetPetCooldownRF (RemoteFunction)
+--   safeEquip, safeUnequip, equipMany, unequipMany
+--   setToArray
+--   _getMutationNamesForUUID (untuk GBXP_MUT_SELECTED & Boost rule)
+--   TAB_AGE_EQUIP_MIN, TAB_AGE_UNEQUIP_MIN, TAB_W_EQUIP_MIN, TAB_W_UNEQUIP_MAX
+--   GBXP_STAGE_MODE, GBXP_MUT_SELECTED, GBXP_MAX_EQUIP
+
+local ActivePetsService = ActivePetsService or require(ReplicatedStorage.Modules.PetServices.ActivePetsService)
+local PetUtilities      = PetUtilities      or require(ReplicatedStorage.Modules.PetServices.PetUtilities)
+local PetRegistry       = PetRegistry       or require(ReplicatedStorage.Data.PetRegistry)
+
+local GameEvents        = ReplicatedStorage:WaitForChild("GameEvents")
+local GetPetCooldownRF  = GetPetCooldownRF or GameEvents:WaitForChild("GetPetCooldown")
+local mutationModule = require(ReplicatedStorage.Data.PetRegistry.PetMutationRegistry)
+------------------------------------------------------------
+-- MODULE TABLE
+------------------------------------------------------------
+local M = {}
+
+-- flag utama loop
+local running       = false
+local __prevRunning = false
+
+-- bisa kamu atur dari luar kalau mau
+local GBXP_DEBUG    = GBXP_DEBUG or false
+local DEBUG_LEVEL   = DEBUG_LEVEL or 2
+
+------------------------------------------------------------
+-- Pastikan table selected ada + helper setToArray
+------------------------------------------------------------
+selected = selected or {
+    boost      = {},
+    xp         = {},
+    noos       = {},
+    seratusage = {},
+    gbxp       = {},
+}
+
+local function setToArray(setTbl)
+    local arr = {}
+    if type(setTbl) ~= "table" then
+        return arr
+    end
+    for uuid, on in pairs(setTbl) do
+        if on then
+            arr[#arr+1] = uuid
+        end
+    end
+    return arr
+end
+
+
+
+-------------------------------------------------------------
+-- MUTATION MAP: EnumId (a, b, c, A, B, ...) â†’ Nama mutasi
+-------------------------------------------------------------
+local MUT_CODE_TO_NAME = {}
+
+do
+    -- Di game ini, daftar mutasi ada di mutationModule.PetMutationRegistry
+    local reg = mutationModule and mutationModule.PetMutationRegistry
+    if type(reg) == "table" then
+        for mutName, def in pairs(reg) do
+            if type(def) == "table" then
+                local code = def.EnumId       -- 'a','b','c','A',...
+                if type(code) == "string" and #code == 1 then
+                    -- contoh: 'c' â†’ "Rainbow", 'A' â†’ "Nightmare"
+                    MUT_CODE_TO_NAME[code] = mutName
+                end
+            end
+        end
+    else
+        warn("[PetSwitcher] PetMutationRegistry invalid:", typeof(reg))
+    end
+
+    -- debug sekali, cuma buat cek di console
+    -- for k,v in pairs(MUT_CODE_TO_NAME) do print("MUT", k, "=>", v) end
+end
+
+
+-- daftar nama mutasi untuk panel kanan GBXP
+local RS = game:GetService("ReplicatedStorage")
+
+-- SESUAI PATH GAME-MU
+local PetMutModule = require(RS.Data.PetRegistry.PetMutationRegistry)
+
+-- Deteksi bentuk modul-nya
+local PetMutReg = PetMutModule.PetMutationRegistry
+if not PetMutReg then
+    -- fallback: kalau modul langsung berisi Shocked/Golden/... tanpa field PetMutationRegistry
+    PetMutReg = PetMutModule
+end
+
+-- Bangun daftar nama mutasi
+local MUTATION_LIST = {}
+
+for mutName, info in pairs(PetMutReg) do
+    -- kalau mau cuma yang bisa dari mutation machine:
+    -- if info.AvaliableFromMutationMachine then
+    --     table.insert(MUTATION_LIST, mutName)
+    -- end
+
+    -- atau tampilkan semua:
+    table.insert(MUTATION_LIST, mutName)
+end
+
+table.sort(MUTATION_LIST)
+--print("[GBXP_MUT] total mutasi:", #MUTATION_LIST)
+
+-- contoh isi:
+-- GBXP_MUT_SELECTED = { Nightmare = true, Rainbow = true, Spectral = true }
+
+GBXP_MUT_SELECTED    = GBXP_MUT_SELECTED or {}
+local GBXP_MUT_SELECTED_LC = GBXP_MUT_SELECTED_LC or {}
+
+local function _refreshMutSelectedLC()
+    table.clear(GBXP_MUT_SELECTED_LC)
+    for name, _ in pairs(GBXP_MUT_SELECTED) do
+        if name then
+            local s = tostring(name)
+            GBXP_MUT_SELECTED[s] = true
+            GBXP_MUT_SELECTED_LC[s:lower()] = true
+        end
+    end
+end
+
+_refreshMutSelectedLC()
+
+local function _isMutationSelected(uuid)
+    local muts = _getMutationNamesForUUID(uuid) or {}
+    if type(muts) ~= "table" then return false end
+
+    local matched = false
+    local dbg = {}
+
+    for _, name in ipairs(muts) do
+        local s  = tostring(name)
+        local sL = s:lower()
+        table.insert(dbg, s)
+        if GBXP_MUT_SELECTED[s] or GBXP_MUT_SELECTED_LC[sL] then
+            matched = true
+        end
+    end
+
+    if not matched then
+   --     print("[GBXP_MUT] uuid=", uuid,
+  --          "mutasi=", (#dbg>0 and table.concat(dbg, "+") or "-"),
+  --          "TIDAK match GBXP_MUT_SELECTED")
+    else
+  --      print("[GBXP_MUT] uuid=", uuid,
+   --         "mutasi=", table.concat(dbg, "+"),
+    --        "MATCH GBXP_MUT_SELECTED")
+    end
+
+    return matched
+end
+
+
+----------------------------------------------------------------
+-- UUID & Number helpers
+----------------------------------------------------------------
+local function __normUUID(u)
+    if not u or u == "" then return nil, nil end
+    local core = tostring(u):match("{?([0-9a-fA-F%-]+)}?") or tostring(u)
+    return core, "{"..core.."}"
+end
+
+local function __toNumberKG(v)
+    if v == nil then return nil end
+    if type(v) == "number" then return v end
+    local s = tostring(v):lower()
+    s = s:gsub("[^%d%,%.]+", "")  -- keep digits, comma, dot
+    s = s:gsub(",", ".")
+    return tonumber(s)
+end
+
+----------------------------------------------------------------
+-- SCALE (auto-normalize: 2 => 0.02)
+----------------------------------------------------------------
+local SCALE_PER_LVL = PetRegistry.PetConfig.WEIGHT_CONFIG.SCALE_PERCENTAGE_OF_BASE_WEIGHT_PER_LEVEL
+local SCALE = SCALE_PER_LVL
+
+----------------------------------------------------------------
+-- Type / favorite / age extractors
+----------------------------------------------------------------
+local function __norm_text(s)
+    s = tostring(s or ""):lower()
+    s = s:gsub("[%c%p]+", " "):gsub("%s+"," ")
+    s = s:match("^%s*(.-)%s*$") or s
+    return s
+end
+
+local function __pet_type_from_record(rec)
+    if type(rec) ~= "table" then return nil end
+    local PD = rec.PetData or rec.Data or {}
+    local petTypeRaw = rec.Type or rec.PetType or PD.Type or PD.PetType
+    if petTypeRaw == nil then return nil end
+    return string.lower(tostring(petTypeRaw))
+end
+
+-- FAVORITE = baca murni dari datastore (sesuai dump)
+local function __is_favorite(rec)
+    if type(rec) ~= "table" then return false end
+
+    local PD = rec.PetData or rec.Data or {}
+
+    -- 1) Prioritas: PetData.IsFavorite
+    if typeof(PD.IsFavorite) == "boolean" then
+        return PD.IsFavorite
+    end
+
+    -- 2) Fallback: rec.IsFavorite (beberapa pet bisa taruh di root)
+    if typeof(rec.IsFavorite) == "boolean" then
+        return rec.IsFavorite
+    end
+
+    -- 3) Kalau nggak ada field sama sekali â†’ anggap BUKAN fav
+    return false
+end
+
+
+-- true kalau GBXP_TYPE_WHITELIST tidak punya entry sama sekali
+local function __is_whitelist_empty()
+    if type(GBXP_TYPE_WHITELIST) ~= "table" then
+        return true
+    end
+    for _ in pairs(GBXP_TYPE_WHITELIST) do
+        return false -- ada minimal 1 key
+    end
+    return true
+end
+
+
+local function __whitelist_match(petTypeNorm)
+    if not petTypeNorm or petTypeNorm == "" then
+        return false
+    end
+
+    -- kalau whitelist kosong, anggap SEMUA type lolos
+    if __is_whitelist_empty() then
+        return true
+    end
+
+    for key,_ in pairs(GBXP_TYPE_WHITELIST) do
+        local pat = __norm_text(key)
+        if #pat > 0 and petTypeNorm:find(pat, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+
+local function __number_from_candidates(tbl, keys, srcOut)
+    for _,k in ipairs(keys) do
+        local v = tbl[k]
+        if type(v) == "number" then if srcOut then srcOut[1]=k end; return v end
+        if type(v) == "string" then
+            local n = tonumber((v:gsub(",", ".")))
+            if n then if srcOut then srcOut[1]=k end; return n end
+        end
+    end
+    return nil
+end
+
+local function __age_from_record(rec, srcOut)
+    local PD = rec.PetData or rec.Data or {}
+    return __number_from_candidates(rec, {"Age","age","Level","level"}, srcOut)
+        or __number_from_candidates(PD,  {"Age","age","Level","level"}, srcOut)
+end
+
+local function __base_from_record(rec, srcOut)
+    local PD = rec.PetData or rec.Data or {}
+    return __number_from_candidates(rec, {"BaseWeight","BaseWeightKG","WeightBase","baseWeight","base_weight"}, srcOut)
+        or __number_from_candidates(PD,  {"BaseWeight","BaseWeightKG","WeightBase","baseWeight","base_weight"}, srcOut)
+end
+
+local function __current_from_record(rec, srcOut)
+    local PD = rec.PetData or rec.Data or {}
+    return __number_from_candidates(rec, {"Weight","weight","KG","kg","W","w","WeightNow","weight_now","currentWeight"}, srcOut)
+        or __number_from_candidates(PD,  {"Weight","weight","KG","kg","W","w","WeightNow","weight_now","currentWeight"}, srcOut)
+end
+
+----------------------------------------------------------------
+-- getBaseKg via datastore (core/braced key)
+----------------------------------------------------------------
+local function getBaseKg(uuid)
+    if not uuid or uuid == "" then return nil end
+    local core, braced = __normUUID(uuid)
+
+    if not ActivePetsService or not ActivePetsService.GetPlayerDatastorePetData then
+        d("ActivePetsService:GetPlayerDatastorePetData MISSING")
+        return nil
+    end
+
+    local ok, store = pcall(function()
+        return ActivePetsService:GetPlayerDatastorePetData(LocalPlayer.Name)
+    end)
+    if not ok then d("GetPlayerDatastorePetData ERROR"); return nil end
+    if not store or not store.PetInventory or not store.PetInventory.Data then
+        d("Store/PetInventory/Data EMPTY")
+        return nil
+    end
+
+    local rec = store.PetInventory.Data[core] or store.PetInventory.Data[braced]
+    if type(rec) ~= "table" then return nil end
+    local PD = rec.PetData or rec.Data or {}
+    local raw = rec.BaseWeight or rec.BaseWeightKG or rec.WeightBase
+            or PD.BaseWeight  or PD.BaseWeightKG  or PD.WeightBase
+    local n = __toNumberKG(raw)
+    return n
+end
+
+----------------------------------------------------------------
+-- weight@100 resolver (rec + uuid) + DEBUG sumber
+----------------------------------------------------------------
+local function __weight_at_100(rec, uuid, dbg)
+    local bw_src, cur_src, age_src = {""},{""},{""}
+    local bw_rec = __base_from_record(rec, bw_src)
+    local age    = __age_from_record(rec, age_src)
+    local cur    = __current_from_record(rec, cur_src)
+
+    -- A) pakai base dari record
+    if bw_rec then
+        local w100 = bw_rec * (1 + SCALE * 100)
+        if dbg then dbg.mode="rec.base"; dbg.bw=bw_rec; dbg.bw_src=bw_src[1]; dbg.cur=cur; dbg.cur_src=cur_src[1]; dbg.age=age; dbg.age_src=age_src[1]; dbg.w100=w100 end
+        return w100
+    end
+
+    -- B) referensi base dari datastore (by UUID)
+    local bw_ref = uuid and getBaseKg(uuid) or nil
+    if bw_ref then
+        local w100 = bw_ref * (1 + SCALE * 100)
+        if dbg then dbg.mode="ref.base"; dbg.bw=bw_ref; dbg.bw_src="getBaseKg()"; dbg.cur=cur; dbg.cur_src=cur_src[1]; dbg.age=age; dbg.age_src=age_src[1]; dbg.w100=w100 end
+        return w100
+    end
+
+    -- C) proyeksi dari current + age
+    if cur and age then
+        local delta = math.max(0, 100 - age)
+        local w100 = cur * (1 + SCALE * delta)
+        if dbg then dbg.mode="proj.cur+age"; dbg.bw=nil; dbg.bw_src="nil"; dbg.cur=cur; dbg.cur_src=cur_src[1]; dbg.age=age; dbg.age_src=age_src[1]; dbg.w100=w100 end
+        return w100
+    end
+
+    if dbg then dbg.mode="none"; dbg.bw=nil; dbg.bw_src="nil"; dbg.cur=cur; dbg.cur_src=cur_src[1]; dbg.age=age; dbg.age_src=age_src[1]; dbg.w100=nil end
+    return nil
+end
+
+----------------------------------------------------------------
+-- Bag fetch
+----------------------------------------------------------------
+local function __getStoreBag()
+    if not ActivePetsService or not ActivePetsService.GetPlayerDatastorePetData then
+        d("ActivePetsService:GetPlayerDatastorePetData not available"); return nil
+    end
+    local ok, store = pcall(function()
+        return ActivePetsService:GetPlayerDatastorePetData(LocalPlayer.Name)
+    end)
+    if not ok then d("GetPlayerDatastorePetData error"); return nil end
+    if not store or not store.PetInventory or not store.PetInventory.Data then
+        d("Store/PetInventory/Data empty"); return nil
+    end
+    return store.PetInventory.Data
+end
+
+
+local function __mutation_names_from_record(rec)
+    if type(rec) ~= "table" then return {} end
+
+    -- di screenshot: PetData.MutationType = "B"
+    local PD = rec.PetData or rec.Data or {}
+
+    local raw =
+        PD.MutationType or             -- ini yang kepakai di game-mu
+        rec.MutationType  or
+        PD.Mutations      or PD.Mutation or PD.MutationCodes or
+        rec.Mutations     or rec.Mutation or rec.MutationCodes
+
+    if not raw then
+        return {}
+    end
+
+    local codes = {}
+
+    if type(raw) == "string" then
+        -- contoh: "B" / "BSR"
+        for c in raw:gmatch("%a") do
+            table.insert(codes, c)
+        end
+
+    elseif type(raw) == "table" then
+        for _, v in pairs(raw) do
+            if type(v) == "string" then
+                for c in v:gmatch("%a") do
+                    table.insert(codes, c)
+                end
+            elseif type(v) == "table" and type(v.MutationType) == "string" then
+                for c in v.MutationType:gmatch("%a") do
+                    table.insert(codes, c)
+                end
+            end
+        end
+    end
+
+    local names, seen = {}, {}
+    for _, code in ipairs(codes) do
+        local name = MUT_CODE_TO_NAME[code]
+        if name and not seen[name] then
+            seen[name] = true
+            table.insert(names, name)
+        end
+    end
+
+    return names
+end
+
+
+
+-- Ambil record pet dari UUID (aman pakai pcall, coba beberapa metode umum)
+-- asumsi sudah ada:
+local MUT_NAME_CACHE = MUT_NAME_CACHE or {}
+
+local function _getPetRecord(uuid)
+    if not uuid then return nil end
+    uuid = tostring(uuid)
+
+    --------------------------------------------------------
+    -- 1) PAKAI DATASTORE BAG dulu (sama seperti listPetsForTab)
+    --------------------------------------------------------
+    local bag = __getStoreBag and __getStoreBag()
+    if bag then
+        for rawUUID, rec in pairs(bag) do
+            if type(rec) == "table" then
+                local core, br
+                if __normUUID then
+                    core, br = __normUUID(rawUUID)
+                else
+                    core = tostring(rawUUID)
+                end
+                local norm = tostring(br or core or rawUUID)
+                if norm == uuid then
+                    -- ini rec yang sama dengan yang dipakai listPetsForTab
+                    return rec
+                end
+            end
+        end
+    end
+
+    --------------------------------------------------------
+    -- 2) Fallback ke PetUtilities (kalau ada & bentuknya table)
+    --------------------------------------------------------
+    if PetUtilities and PetUtilities.GetPetByUUID then
+        local ok, rec = pcall(function()
+            return PetUtilities:GetPetByUUID(LocalPlayer, uuid)
+        end)
+        if ok and rec and type(rec) == "table" then
+            return rec
+        end
+    end
+
+    --------------------------------------------------------
+    -- 3) Fallback terakhir: PetsService
+    --------------------------------------------------------
+    if PetsService then
+        local ok, rec = pcall(function()
+            if PetsService.GetPetByUUID then
+                return PetsService:GetPetByUUID(LocalPlayer, uuid)
+            elseif PetsService.GetPet then
+                return PetsService:GetPet(uuid)
+            end
+        end)
+        if ok and rec then
+            return rec
+        end
+    end
+
+    return nil
+end
+
+
+
+-- HAPUS atau abaikan: local MUT_NAME_CACHE = MUT_NAME_CACHE or {}
+
+local function _getMutationNamesForUUID(uuid)
+    if not uuid then return {} end
+    uuid = tostring(uuid)
+
+    local rec = _getPetRecord and _getPetRecord(uuid) or nil
+    if not rec then
+        --print("[MUT] uuid", uuid, "rec=nil (tidak ketemu di bag/PetUtilities)")
+        return {}
+    end
+
+    local names = __mutation_names_from_record(rec) or {}
+
+    local rawMT
+    if type(rec) == "table" then
+        local PD = rec.PetData or rec.Data or {}
+        rawMT = PD.MutationType or rec.MutationType
+    end
+
+  --  print("[MUT] uuid", uuid,
+   --       "raw MutationType=", tostring(rawMT),
+   --       "names=", (#names>0 and table.concat(names, "+") or "-"))
+
+    return names
+end
+
+------------------------------------------------------------
+-- Fallback safeEquip / safeUnequip / equipMany / unequipMany
+-- (dipakai kalau versi global belum ada)
+------------------------------------------------------------
+local PetsService = PetsService or require(ReplicatedStorage.Modules.PetServices.PetsService)
+
+if not safeEquip then
+    function safeEquip(uuid)
+        if not uuid or uuid == "" then return end
+        pcall(function()
+            PetsService:EquipPet(uuid)
+        end)
+    end
+end
+
+if not safeUnequip then
+    function safeUnequip(uuid)
+        if not uuid or uuid == "" then return end
+        pcall(function()
+            PetsService:UnequipPet(uuid)
+        end)
+    end
+end
+
+if not equipMany then
+    function equipMany(uuids)
+        if type(uuids) ~= "table" then return end
+        for _, u in ipairs(uuids) do
+            safeEquip(u)
+        end
+    end
+end
+
+if not unequipMany then
+    function unequipMany(uuids)
+        if type(uuids) ~= "table" then return end
+        for _, u in ipairs(uuids) do
+            safeUnequip(u)
+        end
+    end
+end
+
+-- kumpulkan semua uuid yang dipakai AutoKG (boost / noos / seratusage / xp / gbxp)
+local function unequipAllAutoKG()
+    local all = {}
+
+    local function addFrom(setTbl)
+        if type(setTbl) ~= "table" then return end
+        for uuid, on in pairs(setTbl) do
+            if on then
+                all[uuid] = true
+            end
+        end
+    end
+
+    addFrom(selected.boost)
+    addFrom(selected.noos)
+    addFrom(selected.seratusage)
+    addFrom(selected.xp)
+    addFrom(selected.gbxp)
+
+    for uuid, _ in pairs(all) do
+        safeUnequip(uuid)
+    end
+end
+
+------------------------------------------------------------
+-- ðŸ” Ambil level pet (AGE) dengan debug lengkap
+------------------------------------------------------------
+local function _norm(u)
+    -- buang/ambil kurung kurawal bila ada
+    if not u or u == "" then return nil end
+    local core = tostring(u):match("{?([0-9a-fA-F%-]+)}?") or tostring(u)
+    return core, "{"..core.."}"
+end
+
+local function _pickLevel(t)
+    if type(t) ~= "table" then return nil end
+    return tonumber(t.Level)
+        or tonumber(t.PetData and t.PetData.Level)
+        or tonumber(t.Data    and t.Data.Level)
+end
+
+if not getPetAge then
+    function getPetAge(uuid)
+        if not uuid or uuid == "" then return nil end
+        local uNorm, uBraced = _norm(uuid)
+
+        -- 1) Coba via PetUtilities (uNorm â†’ uBraced)
+        for _,u in ipairs({uNorm, uBraced}) do
+            local ok, data = pcall(function()
+                return PetUtilities:GetPetByUUID(LocalPlayer, u)
+            end)
+            if ok and type(data) == "table" then
+                local lvl = _pickLevel(data)
+                if lvl then return lvl end
+            end
+        end
+
+        -- 2) Fallback: baca full datastore lewat ActivePetsService
+        local ok, store = pcall(function()
+            return ActivePetsService:GetPlayerDatastorePetData(LocalPlayer.Name)
+        end)
+        if not ok or not store then
+            warn("[getPetAge] Datastore belum siap.")
+            return nil
+        end
+
+        local bag = store.PetInventory and store.PetInventory.Data
+        if not bag then return nil end
+
+        -- coba kedua kunci: tanpa kurung & dengan kurung
+        local pet = bag[uNorm] or bag[uBraced]
+        if not pet then
+            -- tidak usah warn spam; cukup nil menandakan belum ada
+            return nil
+        end
+
+        local lvl = _pickLevel(pet)
+        if not lvl then
+            warn(("âš ï¸ getPetAge: Level tidak ditemukan untuk UUID %s"):format(uNorm))
+        end
+        return lvl
+    end
+end
+
+------------------------------------------------------------
+-- Skill tokens / XP stuck config (opsional)
+------------------------------------------------------------
+local ELE_SKILL_TOKENS = ELE_SKILL_TOKENS or { "rainbow jumbo blessing", "jumbo blessing", "jumbo" }
+
+local XP_SKILL_TOKENS = XP_SKILL_TOKENS or {
+    "friendly frier",
+    "mining",
+    "rainbow frilled reptile",
+}
+
+local XP_STUCK      = XP_STUCK or {}     -- [uuid] = { last = number|nil, sameCount = 0, lastLabel = "" }
+local XP_STUCK_TOL  = XP_STUCK_TOL or 0.1
+local XP_STUCK_N    = XP_STUCK_N or 15   -- jumlah loop berturut-turut
+
+------------------------------------------------------------
+-- Util normalisasi label skill & waktu
+------------------------------------------------------------
+local function _normSkillLabel(s)
+    s = string.lower(tostring(s or ""))
+    s = s:gsub("%b[]",""):gsub("[^%w%s]"," "):gsub("%s+"," ")
+    return (s:gsub("^%s+",""):gsub("%s+$",""))
+end
+
+local function _parseCooldownSeconds(v)
+    if type(v) == "number" then return v end
+    if type(v) ~= "string" then return 0 end
+    local s = v:lower():gsub(",", "."):gsub("%s+", " "):gsub("^%s*(.-)%s*$", "%1")
+    local m, sec = s:match("^(%d+)%s*:%s*(%d+)$")
+    if m and sec then return tonumber(m)*60 + tonumber(sec) end
+    local mm = s:match("(%d+)%s*m")
+    local ss = s:match("(%d+)%s*s")
+    if mm or ss then return (tonumber(mm) or 0)*60 + (tonumber(ss) or 0) end
+    return tonumber(s:match("[-+]?%d+%.?%d*")) or 0
+end
+
+local function _fmtMMSS(sec)
+    sec = math.max(0, math.floor(tonumber(sec) or 0))
+    local m = math.floor(sec/60)
+    local s = sec % 60
+    return string.format("%d:%02d", m, s)
+end
+
+local formatMMSS = _fmtMMSS
+
+------------------------------------------------------------
+-- RF cooldown caching
+------------------------------------------------------------
+local _CD_CACHE   = {}      -- [uuid] = { ts=tick(), cds=table }
+local _CD_MAX_AGE = 0.5     -- detik cache per loop
+
+local function _getCooldowns(uuid)
+    if not uuid or uuid == "" then return nil end
+    local now = tick()
+    local c = _CD_CACHE[uuid]
+    if c and (now - c.ts) <= _CD_MAX_AGE then
+        return c.cds
+    end
+    local ok, cds = pcall(function() return GetPetCooldownRF:InvokeServer(uuid) end)
+    if ok and type(cds) == "table" then
+        _CD_CACHE[uuid] = { ts = now, cds = cds }
+        return cds
+    end
+    return nil
+end
+
+local function _getCooldownForTokens(uuid, TOKENS)
+    if not uuid or uuid == "" then return nil, nil end
+    local cds = _getCooldowns(uuid)
+    if type(cds) ~= "table" then return nil, nil end
+    for _, cd in ipairs(cds) do
+        local label = _normSkillLabel(cd.Skill or cd.Passive)
+        if label ~= "" then
+            for _, tok in ipairs(TOKENS) do
+                if string.find(label, tok, 1, true) then
+                    return _parseCooldownSeconds(cd.Time), label
+                end
+            end
+        end
+    end
+    return nil, nil
+end
+
+------------------------------------------------------------
+-- WEIGHT@LEVEL100 (tanpa base)
+------------------------------------------------------------
+local SCALE = PetRegistry.PetConfig.WEIGHT_CONFIG.SCALE_PERCENTAGE_OF_BASE_WEIGHT_PER_LEVEL
+local WEIGHT100_THRESHOLD = WEIGHT100_THRESHOLD or 60.5
+local EPS_W100 = EPS_W100 or 1e-6
+
+local function __normUUID(u)
+    if not u then return nil, nil end
+    local core = tostring(u):match("{?([0-9a-fA-F%-]+)}?") or tostring(u)
+    return core, "{"..core.."}"
+end
+
+local function __toNumberKG(v)
+    if v == nil then return nil end
+    if type(v) == "number" then return v end
+    if type(v) == "string" then
+        local s = v:lower():gsub("%s+",""):gsub("kg",""):gsub(",", ".")
+        local num = tonumber(s:match("[-+]?%d+%.?%d*"))
+        return num
+    end
+    return nil
+end
+
+if not getBaseKg then
+    function getBaseKg(uuid)
+        if not uuid or uuid == "" then return nil end
+        local core, braced = __normUUID(uuid)
+
+        -- 1) datastore client
+        local ok, store = pcall(function()
+            return ActivePetsService:GetPlayerDatastorePetData(LocalPlayer.Name)
+        end)
+        if ok and store and store.PetInventory and store.PetInventory.Data then
+            local rec = store.PetInventory.Data[core] or store.PetInventory.Data[braced]
+            if type(rec) == "table" then
+                local v = rec.BaseWeight or rec.BaseWeightKG
+                        or (rec.PetData and (rec.PetData.BaseWeight or rec.PetData.BaseWeightKG))
+                        or (rec.Data    and (rec.Data.BaseWeight    or rec.Data.BaseWeightKG))
+                v = __toNumberKG(v)
+                if v then return v end
+            end
+        end
+
+        return nil
+    end
+end
+
+if not getWeightAtLevel100 then
+    function getWeightAtLevel100(uuid)
+        local base = getBaseKg and getBaseKg(uuid) or nil
+        if not base then return nil end
+        return base * (1 + SCALE * 100)
+    end
+end
+
+------------------------------------------------------------
+-- GBXP MAIN LOOP CONFIG
+------------------------------------------------------------
+local EPS                     = EPS or 1e-6
+local ACTION_DELAY_SEC        = ACTION_DELAY_SEC or 0.12
+local TRACE_EVERY_N           = TRACE_EVERY_N or 20
+DEBUG_LEVEL                   = DEBUG_LEVEL or 2
+
+local AGE_MIN_EQUIP           = AGE_MIN_EQUIP or 40
+local DEFAULT_W100_MAX        = DEFAULT_W100_MAX or 60.45
+local W100_MAX_EQUIP          = math.abs((TAB_W_EQUIP_MIN and TAB_W_EQUIP_MIN.noos) or DEFAULT_W100_MAX)
+local AGE_MAX_UNEQUIP_B       = AGE_MAX_UNEQUIP_B or 100
+local REEQUIP_RETRY_SEC       = REEQUIP_RETRY_SEC or 4
+local B_AFTER_ACTION_WAIT_SEC = B_AFTER_ACTION_WAIT_SEC or 600
+
+local __loopCounter = 0
+
+local function _ts()
+    local s = os and os.date and os.date("%H:%M:%S") or tostring(tick()):sub(1,6)
+    return "["..s.."]"
+end
+
+local function d(lvl, ...)
+    if not GBXP_DEBUG then return end
+    if (lvl or 2) > DEBUG_LEVEL then return end
+    local parts = { _ts(), "[GBXP]" }
+    for i = 1, select("#", ...) do
+        parts[#parts+1] = tostring(select(i, ...))
+    end
+    print(table.concat(parts, " "))
+end
+
+local function dx(...)
+    d(3, ...)
+end
+
+------------------------------------------------------------
+-- State untuk GBXP
+------------------------------------------------------------
+local LAST_TARGET_UUID = LAST_TARGET_UUID or nil
+local LAST_MODE        = LAST_MODE or nil
+local _LAST_TRY_EQUIP  = _LAST_TRY_EQUIP or {}
+
+local GBXP_LOCAL = GBXP_LOCAL or {
+    equippedUUID    = nil,
+    equipModeByUUID = {},
+}
+
+local STAGE_ORDER   = { "A", "B", "C", "D" }
+local CURRENT_STAGE = CURRENT_STAGE or "A"
+
+------------------------------------------------------------
+-- World snapshot
+------------------------------------------------------------
+local function _getEquippedSetFromWorld()
+    local set = {}
+
+    -- 1) runtime active pets
+    local ok1, active = pcall(function()
+        return ActivePetsService and ActivePetsService:GetActivePetsForPlayer(LocalPlayer)
+    end)
+    if ok1 and type(active) == "table" then
+        for _, u in ipairs(active) do
+            set[tostring(u)] = true
+        end
+    end
+
+    -- 2) datastore snapshot (optional)
+    local ok2, pdata = pcall(function()
+        return ActivePetsService and ActivePetsService:GetPlayerDatastorePetData(LocalPlayer.Name)
+    end)
+    if ok2 and type(pdata) == "table" then
+        local PD = pdata.PetsData or pdata.Data or pdata
+        local eq = PD and (PD.EquippedPets or PD.equipped or PD.Equipped) or nil
+        if type(eq) == "table" then
+            for _, u in ipairs(eq) do
+                set[tostring(u)] = true
+            end
+        end
+    end
+
+    return set
+end
+
+local function _isEquippedNow(uuid, worldSet)
+    if not uuid then return false end
+    return worldSet[tostring(uuid)] == true
+end
+
+local function _isInStore(uuid)
+    if hasPetInStore then
+        local ok, res = pcall(hasPetInStore, uuid)
+        if ok then return res end
+    end
+    return true
+end
+
+------------------------------------------------------------
+-- Safe wrappers untuk equip/unequip
+------------------------------------------------------------
+local function _safeEquip(u, why, where)
+    if not u then return end
+    d(2, "equip", u, where and ("@"..where) or "", why and ("| "..why) or "")
+    local ok, err = pcall(function() safeEquip(u) end)
+    if not ok then d(1, "equip-fail", u, tostring(err)) end
+    task.wait(ACTION_DELAY_SEC)
+end
+
+local function _safeUnequip(u, why, where)
+    if not u then return end
+    d(2, "unequip", u, where and ("@"..where) or "", why and ("| "..why) or "")
+    local ok, err = pcall(function() safeUnequip(u) end)
+    if not ok then d(1, "unequip-fail", u, tostring(err)) end
+    task.wait(ACTION_DELAY_SEC)
+end
+
+local function _equipMany(arr, why, where)
+    if type(arr) ~= "table" or #arr == 0 then return end
+    d(2, "equipMany #"..tostring(#arr), where and ("@"..where) or "", why or "")
+    local ok, err = pcall(function() equipMany(arr) end)
+    if not ok then d(1, "equipMany-fail", tostring(err)) end
+    task.wait(ACTION_DELAY_SEC)
+end
+
+local function _unequipMany(arr, why, where)
+    if type(arr) ~= "table" or #arr == 0 then return end
+    d(2, "unequipMany #"..tostring(#arr), where and ("@"..where) or "", why or "")
+    local ok, err = pcall(function() unequipMany(arr) end)
+    if not ok then d(1, "unequipMany-fail", tostring(err)) end
+    task.wait(ACTION_DELAY_SEC)
+end
+
+------------------------------------------------------------
+-- GBXP stage & rule helpers
+------------------------------------------------------------
+local function _isMutationSelected(uuid)
+    if not _getMutationNamesForUUID then return false end
+    local muts = _getMutationNamesForUUID(uuid) or {}
+    if type(muts) ~= "table" then return false end
+
+    for _, name in ipairs(muts) do
+        name = tostring(name)
+        local k1 = name
+        local k2 = name:lower()
+        if GBXP_MUT_SELECTED[k1] or GBXP_MUT_SELECTED[k2] then
+            return true
+        end
+    end
+    return false
+end
+
+local function _getCutoffAge()
+    local v = TAB_AGE_UNEQUIP_MIN and TAB_AGE_UNEQUIP_MIN.gbxp
+    if type(v) == "number" and v > 0 then
+        return v
+    end
+    return AGE_MAX_UNEQUIP_B
+end
+
+local function _modeNeedsMutToFinish(mode)
+    mode = tostring(mode or "auto"):upper()
+    -- mode yang wajib mutasi cocok supaya FINISH
+    return (mode == "AUTO" or mode == "A" or mode == "CAD")
+end
+
+local function _getStageForGBXP(uuid)
+    local mode   = tostring(GBXP_STAGE_MODE or "auto"):upper()
+    local isAuto = (mode == "AUTO")
+
+    local mutMatch = _isMutationSelected(uuid)
+
+    ----------------------------------------------------------------
+    -- MODE A â†’ PURE MUTATION MODE
+    ----------------------------------------------------------------
+    if mode == "A" then
+        if mutMatch then
+            -- sudah dapat mutasi target, selesai
+            return nil
+        else
+            -- belum mutasi target, tetap di stage A
+            return "A"
+        end
+    end
+    
+    if mode == "D" then
+        local age = getPetAge(uuid)
+        if not age then return nil end
+        age = math.floor(age + EPS)
+
+        local cutoffAge = _getCutoffAge()
+        if age >= (cutoffAge - EPS) then
+            return nil -- finish
+        end
+        return "D"
+    end
+
+    ----------------------------------------------------------------
+    -- MODE selain A â†’ pakai age + KG100
+    ----------------------------------------------------------------
+    local age  = getPetAge(uuid)
+    local w100 = getWeightAtLevel100(uuid)
+    if not age or not w100 then return nil end
+
+    age = math.floor(age + EPS)
+
+    local cutoffAge = _getCutoffAge()
+
+    -- apakah butuh mutasi cocok untuk dianggap FINISH?
+    local requireMutToFinish = _modeNeedsMutToFinish(mode)
+    local finishMutOK = (not requireMutToFinish) or mutMatch
+
+    -- FINISH / SELESAI
+    if age >= (cutoffAge - EPS)
+       and w100 >= (W100_MAX_EQUIP - EPS)
+       and finishMutOK then
+        return nil
+    end
+
+    ----------------------------------------------------------------
+    -- STAGE A (cari mutasi)
+    --  - AUTO / mode yang mengandung "A": sama seperti dulu
+    --  - CAD: cuma kalau KG sudah tembus & umur >= equip age tab BOOST
+    ----------------------------------------------------------------
+    if not mutMatch then
+        local modeHasA = (mode:find("A", 1, true) ~= nil)
+
+        if isAuto or modeHasA then
+            if mode == "CAD" then
+                local minAgeA = 0
+                if TAB_AGE_EQUIP_MIN and type(TAB_AGE_EQUIP_MIN.boost) == "number" then
+                    minAgeA = TAB_AGE_EQUIP_MIN.boost
+                end
+
+                if age >= (minAgeA - EPS) and w100 >= (W100_MAX_EQUIP - EPS) then
+                    return "A"
+                end
+            else
+                -- AUTO / CD / DC yang punya "A" â†’ stage A begitu belum mutasi
+                return "A"
+            end
+        end
+    end
+
+    ----------------------------------------------------------------
+    -- Stage B / C / D sama seperti versi lama
+    ----------------------------------------------------------------
+
+    -- Stage B / D untuk umur < 40
+    if age < (40 - EPS) then
+        if (not isAuto)
+           and (mode == "CD" or mode == "DC" or mode == "CAD")
+           and w100 >= (W100_MAX_EQUIP - EPS) then
+            return "D"
+        end
+        return "B"
+    end
+
+    -- Stage C: umur >= 40, KG100 belum tembus limit
+    if age >= (40 - EPS) and w100 < (W100_MAX_EQUIP - EPS) then
+        return "C"
+    end
+
+    -- Stage D: KG100 sudah cukup, umur belum sampai cutoff
+    if w100 >= (W100_MAX_EQUIP - EPS) and age < (cutoffAge - EPS) then
+        return "D"
+    end
+
+    return nil
+end
+
+
+
+
+local function _shouldUnequipGBXP(uuid)
+    local mode   = tostring(GBXP_STAGE_MODE or "auto"):upper()
+    local isAuto = (mode == "AUTO")
+
+    local mutMatch = _isMutationSelected(uuid)
+
+    ----------------------------------------------------------------
+    -- MODE A â†’ selesai kalau MUTASI SUDAH COCOK
+    ----------------------------------------------------------------
+    if mode == "A" then
+        return mutMatch
+    end
+
+    ----------------------------------------------------------------
+    -- MODE lain â†’ same finish rule dengan _getStageForGBXP
+    ----------------------------------------------------------------
+    local age  = getPetAge(uuid)
+    local w100 = getWeightAtLevel100(uuid)
+    if not age or not w100 then return false end
+
+    age = math.floor(age + EPS)
+
+    local cutoffAge = _getCutoffAge()
+
+    local requireMutToFinish = _modeNeedsMutToFinish(mode)
+    local finishMutOK = (not requireMutToFinish) or mutMatch
+
+    return age >= (cutoffAge - EPS)
+       and w100 >= (W100_MAX_EQUIP - EPS)
+       and finishMutOK
+end
+
+
+
+------------------------------------------------------------
+-- Start/Stop edges
+------------------------------------------------------------
+local __RESUME_REAPPLY = __RESUME_REAPPLY or false
+
+local function __onStart()
+    __RESUME_REAPPLY            = true
+    LAST_TARGET_UUID            = nil
+    LAST_MODE                   = nil
+    _LAST_TRY_EQUIP             = {}
+    GBXP_LOCAL.equippedUUID     = nil
+    GBXP_LOCAL.equipModeByUUID  = {}
+end
+
+local function __onStop()
+    GBXP_LOCAL.equippedUUID = nil
+end
+
+------------------------------------------------------------
+-- Aturan umur per tab
+------------------------------------------------------------
+local function applyTabAgeRule(tabKey, arr, minAge)
+    if not minAge or type(arr) ~= "table" or #arr == 0 then return end
+
+    local equipAge   = TAB_AGE_EQUIP_MIN[tabKey]   or 0
+    local unequipAge = TAB_AGE_UNEQUIP_MIN[tabKey] or 0
+
+    if minAge < (equipAge - EPS) then
+        _unequipMany(
+            arr,
+            string.format("minAge<%.0f â†’ %s OFF (age<equip)", equipAge, tabKey),
+            "age-"..tabKey.."-low"
+        )
+        return
+    end
+
+    if unequipAge > 0 and unequipAge > equipAge and minAge >= (unequipAge - EPS) then
+        _unequipMany(
+            arr,
+            string.format("minAge>=%.0f â†’ %s OFF (age>unequip)", unequipAge, tabKey),
+            "age-"..tabKey.."-high"
+        )
+        return
+    end
+
+    _equipMany(
+        arr,
+        string.format("minAge in [%.0f,%.0f) â†’ %s ON", equipAge, unequipAge, tabKey),
+        "age-"..tabKey.."-on"
+    )
+end
+
+------------------------------------------------------------
+-- Boost vs GBXP mutation
+------------------------------------------------------------
+local function applyBoostRule(tabKey, arr, targetList)
+    tabKey      = tabKey or "boost"
+    arr         = arr or {}
+    targetList  = targetList or {}
+
+    if type(arr) ~= "table" or #arr == 0 then return end
+
+    local equipAge = tonumber(TAB_AGE_EQUIP_MIN[tabKey] or 0) or 0
+
+    local hasMatch      = false
+    local hasNonMatch   = false
+    local anyCandidate  = false
+    local dbg           = {}
+
+    for _, rec in ipairs(targetList) do
+        local age  = rec.age or 0
+        local uuid = rec.uuid
+
+        if (age + EPS) >= equipAge then
+            anyCandidate = true
+
+            local muts = _getMutationNamesForUUID and _getMutationNamesForUUID(uuid) or {}
+            local mutLabelParts = {}
+            local matched = false
+
+            for _, mutName in ipairs(muts) do
+                table.insert(mutLabelParts, mutName)
+
+                local k1 = mutName
+                local k2 = mutName:lower()
+                if GBXP_MUT_SELECTED[k1] or GBXP_MUT_SELECTED[k2] then
+                    matched = true
+                end
+            end
+
+            if matched then
+                hasMatch = true
+            else
+                hasNonMatch = true
+            end
+
+            table.insert(dbg, string.format(
+                "%s[Age=%.1f][%s]%s",
+                tostring(uuid),
+                age,
+                (#mutLabelParts > 0) and table.concat(mutLabelParts, "+") or "-",
+                matched and " MATCH" or " NON_MATCH"
+            ))
+        end
+    end
+
+    if not anyCandidate then
+        _unequipMany(
+            arr,
+            "BOOST OFF (belum ada GBXP age>= " .. equipAge .. " | " .. table.concat(dbg, "; ") .. ")",
+            "boost-no-candidate"
+        )
+        return
+    end
+
+    if hasNonMatch then
+        _equipMany(
+            arr,
+            string.format(
+                "BOOST ON (ada GBXP age>=%.0f dengan mutasi kosong / tidak ada di GBXP_MUT_SELECTED | %s)",
+                equipAge,
+                table.concat(dbg, "; ")
+            ),
+            "boost-gbxp-nonmatch"
+        )
+        return
+    end
+
+    _unequipMany(
+        arr,
+        "BOOST OFF (SEMUA GBXP age>= "
+            .. equipAge
+            .. " punya mutasi di GBXP_MUT_SELECTED | "
+            .. table.concat(dbg, "; ")
+            .. ")",
+        "boost-gbxp-match"
+    )
+end
+
+------------------------------------------------------------
+-- Helper passOneValue untuk age/kg rule
+------------------------------------------------------------
+local function _passOneValue(v, rawMin, rawMax)
+    if v == nil then
+        return true
+    end
+
+    local min = tonumber(rawMin or 0) or 0
+    local max = tonumber(rawMax or 0) or 0
+    local ok  = true
+
+    -- MIN
+    if min ~= 0 then
+        local limit = math.abs(min)
+        if min > 0 then
+            if v < (limit - EPS) then
+                ok = false
+            end
+        else
+            if v > (limit + EPS) then
+                ok = false
+            end
+        end
+    end
+
+    -- MAX
+    if ok and max ~= 0 then
+        local limit = math.abs(max)
+        if max > 0 then
+            if v >= (limit - EPS) then
+                ok = false
+            end
+        else
+            if v <= (limit + EPS) then
+                ok = false
+            end
+        end
+    end
+
+    return ok
+end
+
+local function _computeRoleFlagsForUUID(uuid, ctx)
+    local age  = ctx.targetAge
+    local w100 = ctx.targetW100
+
+    local inBoost = ctx.boostSet[uuid] == true
+    local inXP    = ctx.xpSet[uuid]    == true
+    local inNoos  = ctx.noosSet[uuid]  == true
+    local inAge   = ctx.ageSet[uuid]   == true
+
+    local can = {
+        boost      = false,
+        xp         = false,
+        noos       = false,
+        seratusage = false,
+    }
+
+    local function passAgeKg(tabKey)
+        local aMin = TAB_AGE_EQUIP_MIN[tabKey]
+        local aMax = TAB_AGE_UNEQUIP_MIN[tabKey]
+        local wMin = TAB_W_EQUIP_MIN[tabKey]
+        local wMax = TAB_W_UNEQUIP_MAX[tabKey]
+
+        local okAge = true
+        local okW   = true
+
+        if age then
+            okAge = _passOneValue(age,  aMin, aMax)
+        end
+        if w100 then
+            okW   = _passOneValue(w100, wMin, wMax)
+        end
+
+        return okAge and okW
+    end
+
+    -- BOOST
+    if inBoost and passAgeKg("boost") then
+        can.boost = true
+    end
+
+    -- XP
+    if inXP and passAgeKg("xp") then
+        can.xp = true
+    end
+
+    -- SERATUSAGE
+    if inAge and passAgeKg("seratusage") then
+        can.seratusage = true
+    end
+
+    -- NOOS
+    if inNoos and ctx.wantNoosOn and passAgeKg("noos") then
+        can.noos = true
+    end
+
+    return can
+end
+
+local function _markSupportSet(arr, set, ctx)
+    if type(arr) ~= "table" then return end
+    for _, u in ipairs(arr) do
+        if u ~= nil then
+            set[u] = true
+            if ctx.ageByUUID[u] == nil then
+                ctx.ageByUUID[u] = getPetAge(u)
+            end
+            if ctx.w100ByUUID[u] == nil then
+                ctx.w100ByUUID[u] = getWeightAtLevel100(u)
+            end
+        end
+    end
+end
+
+local function _computeSupportOwners(boostArr, xpArr, noosArr, ageArr, targetList, minAge, wantNoosOn)
+    boostArr   = (type(boostArr)   == "table") and boostArr   or {}
+    xpArr      = (type(xpArr)      == "table") and xpArr      or {}
+    noosArr    = (type(noosArr)    == "table") and noosArr    or {}
+    ageArr     = (type(ageArr)     == "table") and ageArr     or {}
+    targetList = (type(targetList) == "table") and targetList or {}
+
+    local primary        = targetList[1]
+    local targetAge      = primary and primary.age  or nil
+    local targetW100     = primary and primary.w100 or nil
+
+    local ctx = {
+        ageByUUID     = {},
+        w100ByUUID    = {},
+        boostSet      = {},
+        xpSet         = {},
+        noosSet       = {},
+        ageSet        = {},
+        wantNoosOn    = wantNoosOn,
+
+        targetAge     = targetAge,
+        targetW100    = targetW100,
+    }
+
+    for _, rec in ipairs(targetList) do
+        if rec and rec.uuid then
+            ctx.ageByUUID[rec.uuid]  = rec.age
+            ctx.w100ByUUID[rec.uuid] = rec.w100
+        end
+    end
+
+    _markSupportSet(boostArr, ctx.boostSet, ctx)
+    _markSupportSet(xpArr,    ctx.xpSet,    ctx)
+    _markSupportSet(noosArr,  ctx.noosSet,  ctx)
+    _markSupportSet(ageArr,   ctx.ageSet,   ctx)
+
+    local allUUID, seen = {}, {}
+    local function collect(arr)
+        if type(arr) ~= "table" then return end
+        for _, u in ipairs(arr) do
+            if u ~= nil and not seen[u] then
+                seen[u] = true
+                table.insert(allUUID, u)
+            end
+        end
+    end
+
+    collect(boostArr)
+    collect(xpArr)
+    collect(noosArr)
+    collect(ageArr)
+
+    local ownerByUUID = {}
+    local boostOwned, xpOwned, noosOwned, ageOwned = {}, {}, {}, {}
+
+    for _, u in ipairs(allUUID) do
+        local can = _computeRoleFlagsForUUID(u, ctx)
+        ownerByUUID[u] = can
+
+        if can.boost      then table.insert(boostOwned,  u) end
+        if can.xp         then table.insert(xpOwned,     u) end
+        if can.noos       then table.insert(noosOwned,   u) end
+        if can.seratusage then table.insert(ageOwned,    u) end
+    end
+
+    return ownerByUUID, boostOwned, xpOwned, noosOwned, ageOwned
+end
+
+local function _stageAllowedForMode(stage, mode)
+    mode  = tostring(mode or "auto"):upper()
+    stage = tostring(stage or "")
+
+    if mode == "AUTO" then
+        return true
+    end
+
+    if mode == "A" or mode == "B" or mode == "C" or mode == "D" then
+        return stage == mode
+
+    elseif mode == "BC" or mode == "CB" then
+        return stage == "B" or stage == "C"
+
+    elseif mode == "CD" or mode == "DC" then
+        return stage == "C" or stage == "D"
+
+    elseif mode == "CAD" then
+        return stage == "C" or stage == "A" or stage == "D"
+    end
+
+    return true
+end
+
+local function enforceTab(tabArr, ownedArr, globalOwnedSet, tabKey, whyOn, whyOff)
+    if type(tabArr) ~= "table" or #tabArr == 0 then return end
+
+    local ownedSet = {}
+    for _, u in ipairs(ownedArr or {}) do
+        ownedSet[u] = true
+    end
+
+    local ws = _getEquippedSetFromWorld()
+    for _, u in ipairs(tabArr) do
+        local isOn             = _isEquippedNow(u, ws)
+        local shouldOnThisTab  = ownedSet[u] == true
+        local shouldOnGlobally = globalOwnedSet and (globalOwnedSet[u] == true) or false
+
+        if shouldOnThisTab and (not isOn) then
+            _safeEquip(u, whyOn, tabKey)
+        elseif (not shouldOnGlobally) and (not shouldOnThisTab) and isOn then
+            _safeUnequip(u, whyOff, tabKey)
+        end
+    end
+end
+
+local function _makeTargetKey(list)
+    if type(list) ~= "table" or #list == 0 then return nil end
+    local tmp = {}
+    for i, rec in ipairs(list) do
+        tmp[i] = tostring(rec.uuid)
+    end
+    table.sort(tmp)
+    return table.concat(tmp, ",")
+end
+
+-- token loop (anti spawn dobel)
+local LOOP_TOKEN_ATTR = "__AUTOKG_LOOP_TOKEN"
+local token = tostring(os.clock()) .. "_" .. tostring(math.random(1, 1e9))
+------------------------------------------------------------
+-- LOOP UTAMA
+------------------------------------------------------------
+local function mainLoop(token)
+    while true do
+        if G[LOOP_TOKEN_ATTR] ~= token then
+            return
+        end
+        ------------------------------------------------------------
+        -- Start/Stop hook
+        ------------------------------------------------------------
+        if running and (not __prevRunning) then
+            __onStart()
+        elseif (not running) and __prevRunning then
+            __onStop()
+        end
+        __prevRunning = running
+
+        if running then
+            __loopCounter += 1
+
+            GBXP_LOCAL.equipModeByUUID = GBXP_LOCAL.equipModeByUUID or {}
+
+            selected = selected or {}
+            selected.boost       = selected.boost       or {}
+            selected.xp          = selected.xp          or {}
+            selected.noos        = selected.noos        or {}
+            selected.gbxp        = selected.gbxp        or {}
+            selected.seratusage  = selected.seratusage  or {}
+
+            local boostArr   = setToArray(selected.boost)
+            local xpArr      = setToArray(selected.xp)
+            local noosArr    = setToArray(selected.noos)
+            local gbxpArr    = setToArray(selected.gbxp)
+            local ageArr     = setToArray(selected.seratusage)
+
+            if __loopCounter % TRACE_EVERY_N == 1 then
+                d(1, "tick", __loopCounter,
+                    "| gbxp#",  #gbxpArr,
+                    "| boost#", #boostArr,
+                    "xp#",      #xpArr,
+                    "noos#",    #noosArr,
+                    "age#",     #ageArr)
+            end
+
+            --------------------------------------------------------
+            -- 0) RULE SWEEP: unequip yang sudah selesai (age>=max)
+            --------------------------------------------------------
+do
+    local cutoffAge = _getCutoffAge()
+    for _, uuid in ipairs(gbxpArr) do
+        if _shouldUnequipGBXP(uuid) then
+            _safeUnequip(uuid, "rule-sweep FINISH age>="..tostring(cutoffAge), "rule0")
+        end
+    end
+end
+
+
+            --------------------------------------------------------
+            -- 1) BUILD GROUPS STAGE A/B/C/D
+            --------------------------------------------------------
+            local groups = { A = {}, B = {}, C = {}, D = {} }
+
+            for _, uuid in ipairs(gbxpArr) do
+                local stage = _getStageForGBXP(uuid)
+                if stage then
+                    local age  = getPetAge(uuid)
+                    local w100 = getWeightAtLevel100(uuid)
+                    if age and w100 then
+                        table.insert(groups[stage], {
+                            uuid  = uuid,
+                            age   = age,
+                            w100  = w100,
+                            stage = stage,
+                        })
+                    end
+                end
+            end
+
+            --------------------------------------------------------
+            -- 1b) PILIH STAGE AKTIF
+            --------------------------------------------------------
+            local activeStage = nil
+
+            if GBXP_STAGE_MODE ~= "auto" then
+                local forced = tostring(GBXP_STAGE_MODE or "auto"):upper()
+                local stageList = {}
+
+                if forced == "A" or forced == "B" or forced == "C" or forced == "D" then
+                    stageList = { forced }
+
+                elseif forced == "BC" or forced == "CB" then
+                    stageList = { "B", "C" }
+
+                elseif forced == "CD" or forced == "DC" then
+                    stageList = { "C", "D" }
+
+                elseif forced == "CAD" then
+                    stageList = { "C", "A", "D" }
+
+                else
+                    warn("[GBXP] GBXP_STAGE_MODE invalid: ", forced, " â†’ fallback ke auto")
+                    GBXP_STAGE_MODE = "auto"
+                    stageList = {}
+                end
+
+                for _, s in ipairs(stageList) do
+                    if groups[s] and #groups[s] > 0 then
+                        activeStage = s
+                        break
+                    end
+                end
+
+                CURRENT_STAGE = activeStage
+
+            else
+                if CURRENT_STAGE == "D" then
+                    local noABC = (#groups.A == 0)
+                                and (#groups.B == 0)
+                                and (#groups.C == 0)
+                    if noABC and #groups.D > 0 then
+                        activeStage = "D"
+                    else
+                        CURRENT_STAGE = nil
+                    end
+
+                elseif CURRENT_STAGE
+                    and groups[CURRENT_STAGE]
+                    and #groups[CURRENT_STAGE] > 0 then
+                    activeStage = CURRENT_STAGE
+                end
+
+                if not activeStage then
+                    for _, s in ipairs({ "A","B","C" }) do
+                        if #groups[s] > 0 then
+                            activeStage = s
+                            break
+                        end
+                    end
+
+                    if not activeStage and #groups.D > 0 then
+                        activeStage = "D"
+                    end
+                end
+
+                CURRENT_STAGE = activeStage
+            end
+
+            --------------------------------------------------------
+            -- 2) BUILD targetList dari activeStage
+            --------------------------------------------------------
+            local targetList = {}
+            if activeStage then
+                for _, rec in ipairs(groups[activeStage]) do
+                    table.insert(targetList, rec)
+                    if #targetList >= (GBXP_MAX_EQUIP or 1) then
+                        break
+                    end
+                end
+            end
+
+            --------------------------------------------------------
+            -- SOLO STAGE-MISMATCH GUARD (multi GBXP)
+            --------------------------------------------------------
+            if (GBXP_MAX_EQUIP or 1) > 1 then
+                local mode = tostring(GBXP_STAGE_MODE or "auto"):upper()
+
+                local worldSet  = _getEquippedSetFromWorld()
+                local equipped  = {}
+
+                for _, u in ipairs(gbxpArr) do
+                    if _isEquippedNow(u, worldSet) then
+                        table.insert(equipped, u)
+                    end
+                end
+
+                if #equipped == 1 then
+                    local u     = equipped[1]
+                    local stage = _getStageForGBXP(u)
+
+                    local mismatch = false
+
+                    if mode == "AUTO" then
+                        mismatch = (stage == nil)
+                    else
+                        mismatch = stage and (not _stageAllowedForMode(stage, mode))
+                    end
+
+                    if mismatch then
+                        d(1,
+                          "SOLO GBXP stage mismatch:",
+                          "uuid=", u,
+                          "stage=", tostring(stage),
+                          "mode=",  mode,
+                          "â†’ unequip (auto/manual)"
+                        )
+                        _safeUnequip(
+                            u,
+                            "solo GBXP stage "..tostring(stage).." tidak cocok mode "..tostring(mode),
+                            "solo-stage-mismatch"
+                        )
+                    end
+                end
+            end
+
+            --------------------------------------------------------
+            -- Info ringkas target: minAge & hasB
+            --------------------------------------------------------
+            local hasB, minAge = false, nil
+            for _, rec in ipairs(targetList) do
+                if (not minAge) or (rec.age < minAge) then
+                    minAge = rec.age
+                end
+                if rec.w100 >= W100_MAX_EQUIP - EPS then
+                    hasB = true
+                end
+            end
+
+            local targetKey = _makeTargetKey(targetList)
+
+            d(1,
+              "picked STAGE=", tostring(activeStage or "-"),
+              targetKey or "nil",
+              "count=", #targetList,
+              "minAge=", tostring(minAge or "-"),
+              "CURRENT_STAGE=", tostring(CURRENT_STAGE),
+              "MODE=", tostring(GBXP_STAGE_MODE)
+            )
+
+            --------------------------------------------------------
+            -- 3) LOGIKA EQUIP GBXP + TAB SUPPORT
+            --------------------------------------------------------
+            if #targetList > 0 then
+                local weightMode     = hasB and "B" or "A"
+                local targetChanged  = (targetKey ~= LAST_TARGET_UUID)
+                local modeChanged    = (weightMode ~= LAST_MODE)
+
+                local targetSet = {}
+                for _, rec in ipairs(targetList) do
+                    targetSet[rec.uuid] = true
+                end
+
+                if targetChanged or modeChanged or __RESUME_REAPPLY then
+                    d(1, "change/resume:",
+                       "targetChanged=", targetChanged,
+                       "modeChanged=",   modeChanged,
+                       "resume=",        __RESUME_REAPPLY)
+
+
+
+                    -- EQUIP targetList
+                    local worldSet = _getEquippedSetFromWorld()
+                    for _, rec in ipairs(targetList) do
+                        local u = rec.uuid
+                        if _isInStore(u) and (not _isEquippedNow(u, worldSet)) then
+                            _safeEquip(
+                                u,
+                                "GBXP STAGE="..tostring(rec.stage)
+                                    .." age="..tostring(rec.age)
+                                    .." w100="..tostring(rec.w100),
+                                "main-equip"
+                            )
+                            GBXP_LOCAL.equipModeByUUID[u] = weightMode
+                        end
+                    end
+
+                    -- Pastikan hanya targetList yang equip di GBXP tab
+                    worldSet = _getEquippedSetFromWorld()
+                    for _, u in ipairs(gbxpArr) do
+                        if (not targetSet[u]) and _isEquippedNow(u, worldSet) then
+                            _safeUnequip(
+                                u,
+                                "ensure max "..tostring(GBXP_MAX_EQUIP or 1).." GBXP",
+                                "gbxp-guard"
+                            )
+                        end
+                    end
+
+                    -- FLAG NOOS
+                    local wantNoosOn = false
+                    for _, rec in ipairs(targetList) do
+                        if (rec.age > AGE_MIN_EQUIP - EPS)
+                           and (rec.w100 < W100_MAX_EQUIP - EPS) then
+                            wantNoosOn = true
+                            break
+                        end
+                    end
+
+                    if weightMode == "A" then
+                        d(1, "weightMode <"..tostring(W100_MAX_EQUIP).."kg")
+                    else
+                        d(1, "weightMode >="..tostring(W100_MAX_EQUIP).."kg")
+                        if (B_AFTER_ACTION_WAIT_SEC or 0) > 0 then
+                            d(1, "post-actions wait (B, async) ", tostring(B_AFTER_ACTION_WAIT_SEC).."s")
+                            local myEpoch = M.__stopEpoch or 0
+task.spawn(function()
+    task.wait(B_AFTER_ACTION_WAIT_SEC)
+    -- kalau sudah stop/start lagi atau stop dipanggil â†’ jangan ubah apa-apa
+    if (M.__stopEpoch or 0) ~= myEpoch or running == false then
+        return
+    end
+    LAST_MODE = nil
+end)
+
+                        end
+                    end
+
+                    -- Hitung owner untuk XP/NOOS/AGE (tanpa BOOST)
+                    local ownerByUUID, boostOwned, xpOwned, noosOwned, ageOwned =
+                        _computeSupportOwners(
+                            boostArr,
+                            xpArr,
+                            noosArr,
+                            ageArr,
+                            targetList, minAge, wantNoosOn
+                        )
+
+                    local globalOwnedSet = {}
+                    local function markGlobal(arr)
+                        for _, u in ipairs(arr or {}) do
+                            if u ~= nil then
+                                globalOwnedSet[u] = true
+                            end
+                        end
+                    end
+                    
+                    markGlobal(boostOwned)
+                    markGlobal(xpOwned)
+                    markGlobal(noosOwned)
+                    markGlobal(ageOwned)
+                    
+                    
+                    enforceTab(
+    boostArr, boostOwned, globalOwnedSet, "boost",
+    "BOOST owner ON",
+    "BOOST owner OFF"
+)
+
+
+                    enforceTab(
+                        xpArr, xpOwned, globalOwnedSet, "xp",
+                        "XP owner ON",
+                        "XP owner OFF"
+                    )
+
+                    enforceTab(
+                        noosArr, noosOwned, globalOwnedSet, "noos",
+                        "NOOS owner ON",
+                        "NOOS owner OFF"
+                    )
+
+                    enforceTab(
+                        ageArr, ageOwned, globalOwnedSet, "seratusage",
+                        "AGE owner ON",
+                        "AGE owner OFF"
+                    )
+
+                    LAST_TARGET_UUID = targetKey
+                    LAST_MODE        = weightMode
+                    __RESUME_REAPPLY = false
+
+                else
+                    -- STEADY-STATE
+                    local worldSet = _getEquippedSetFromWorld()
+
+                    for _, u in ipairs(gbxpArr) do
+                        if (not targetSet[u]) and _isEquippedNow(u, worldSet) then
+                            _safeUnequip(
+                                u,
+                                "ensure multi GBXP equipped (steady)",
+                                "steady-guard"
+                            )
+                        end
+                    end
+
+                    local now = tick()
+                    for _, rec in ipairs(targetList) do
+                        local u    = rec.uuid
+                        local last = _LAST_TRY_EQUIP[u] or 0
+                        if (not _isEquippedNow(u, worldSet))
+                           and ((now - last) >= REEQUIP_RETRY_SEC)
+                           and _isInStore(u) then
+                            d(1, "ensure: target not equipped â†’ re-equip", u)
+                            _safeEquip(u, "ensure re-equip (multi)", "ensure")
+                            _LAST_TRY_EQUIP[u] = now
+                            GBXP_LOCAL.equipModeByUUID[u] = weightMode
+                        end
+                    end
+
+
+                    local wantNoosOn = false
+                    for _, rec in ipairs(targetList) do
+                        if (rec.age > AGE_MIN_EQUIP - EPS)
+                           and (rec.w100 < W100_MAX_EQUIP - EPS) then
+                            wantNoosOn = true
+                            break
+                        end
+                    end
+
+                    local ownerByUUID, boostOwned, xpOwned, noosOwned, ageOwned =
+                        _computeSupportOwners(
+                            boostArr,
+                            xpArr,
+                            noosArr,
+                            ageArr,
+                            targetList, minAge, wantNoosOn
+                        )
+
+                    local globalOwnedSet = {}
+                    local function markGlobal2(arr)
+                        for _, u in ipairs(arr or {}) do
+                            if u ~= nil then
+                                globalOwnedSet[u] = true
+                            end
+                        end
+                    end
+                    
+                    markGlobal2(boostOwned)
+                    markGlobal2(xpOwned)
+                    markGlobal2(noosOwned)
+                    markGlobal2(ageOwned)
+
+
+enforceTab(
+    boostArr, boostOwned, globalOwnedSet, "boost",
+    "BOOST owner ON (steady)",
+    "BOOST owner OFF (steady)"
+)
+
+                    enforceTab(
+                        xpArr, xpOwned, globalOwnedSet, "xp",
+                        "XP owner ON (steady)",
+                        "XP owner OFF (steady)"
+                    )
+
+                    enforceTab(
+                        noosArr, noosOwned, globalOwnedSet, "noos",
+                        "NOOS owner ON (steady)",
+                        "NOOS owner OFF (steady)"
+                    )
+
+                    enforceTab(
+                        ageArr, ageOwned, globalOwnedSet, "seratusage",
+                        "AGE owner ON (steady)",
+                        "AGE owner OFF (steady)"
+                    )
+
+                    dx("no change â†’ skip big actions (same target set / weightMode)")
+                end
+
+            else
+                -- Tidak ada target GBXP
+                d(1, "no suitable GBXP target this tick (stage A/B/C/D empty / solo-mode / stage-mismatch)")
+
+                if (GBXP_MAX_EQUIP or 1) > 1 then
+                    local mode = tostring(GBXP_STAGE_MODE or "auto"):upper()
+                    if mode ~= "AUTO" then
+                        local worldSet  = _getEquippedSetFromWorld()
+                        local equipped  = {}
+
+                        for _, u in ipairs(gbxpArr) do
+                            if _isEquippedNow(u, worldSet) then
+                                table.insert(equipped, u)
+                            end
+                        end
+
+                        if #equipped == 1 then
+                            local u     = equipped[1]
+                            local stage = _getStageForGBXP(u)
+
+                            if stage and (not _stageAllowedForMode(stage, mode)) then
+                                d(1,
+                                  "SOLO GBXP stage mismatch: uuid=", u,
+                                  "stage=", stage, "mode=", mode,
+                                  "â†’ unequip")
+                                _safeUnequip(
+                                    u,
+                                    "solo GBXP stage "..tostring(stage).." tidak cocok mode "..tostring(mode),
+                                    "solo-stage-mismatch"
+                                )
+                            end
+                        end
+                    end
+                end
+
+                LAST_TARGET_UUID        = nil
+                LAST_MODE               = nil
+                GBXP_LOCAL.equippedUUID = nil
+
+                if __RESUME_REAPPLY then
+                    _equipMany(boostArr,  "resume-baseline", "resume")
+                    _equipMany(xpArr,     "resume-baseline", "resume")
+                    _equipMany(ageArr,    "resume-baseline", "resume")
+                    _unequipMany(noosArr, "resume-baseline", "resume")
+                    __RESUME_REAPPLY = false
+                end
+            end
+
+            --------------------------------------------------------
+            -- 4) XP-STUCK monitor (optional)
+            --------------------------------------------------------
+            if XP_STUCK and _getCooldownForTokens and XP_SKILL_TOKENS then
+                local needReapplyXP = false
+
+                for _, u in ipairs(xpArr) do
+                    local cd, label = _getCooldownForTokens(u, XP_SKILL_TOKENS)
+                    local rec = XP_STUCK[u] or { last = nil, sameCount = 0, lastLabel = "" }
+
+                    if cd == nil then
+                        rec.last, rec.sameCount, rec.lastLabel = nil, 0, ""
+                    else
+                        if rec.last ~= nil then
+                            local diff = cd - rec.last
+                            local tol = XP_STUCK_TOL or 0.1
+                            if diff >= -tol then
+                                rec.sameCount = (rec.sameCount or 0) + 1
+                            else
+                                rec.sameCount = 0
+                            end
+                        else
+                            rec.sameCount = 0
+                        end
+
+                        rec.last      = cd
+                        rec.lastLabel = label or rec.lastLabel
+
+                        if rec.sameCount >= (XP_STUCK_N or 15) then
+                            d(1, "XP stuck â†’ unequip", u, "label=", rec.lastLabel, "cd=", cd)
+                            _safeUnequip(u, "xp stuck", "xp-stuck")
+                            rec.sameCount = 0
+                            needReapplyXP = true
+                        end
+                    end
+
+                    XP_STUCK[u] = rec
+                end
+
+                if needReapplyXP then
+                    _equipMany(xpArr, "XP re-apply sesudah stuck", "xp-reapply")
+                end
+            end
+        end
+
+        task.wait(0.10)
+    end
+end
+
+------------------------------------------------------------
+-- PUBLIC API
+------------------------------------------------------------
+function M.Start(modeId)
+    running = true
+
+    if modeId then
+        if type(setGBXPStageMode) == "function" then
+            setGBXPStageMode(modeId)
+        else
+            GBXP_STAGE_MODE = modeId
+        end
+    end
+
+    d(1, "AutoKGLoop.Start mode=", tostring(modeId or GBXP_STAGE_MODE))
+end
+
+function M.Stop(reason)
+    if not running then
+        return
+    end
+
+    running = false
+    d(1, "AutoKGLoop.Stop()", tostring(reason or ""))
+
+    -- reset state biar bersih total
+    __RESUME_REAPPLY = false
+    LAST_TARGET_UUID = nil
+    LAST_MODE        = nil
+    CURRENT_STAGE    = nil
+    GBXP_LOCAL.equippedUUID = nil
+    GBXP_LOCAL.equipModeByUUID = {}
+
+    -- matikan loop async â€œpost-actions waitâ€ (pakai stop epoch)
+    M.__stopEpoch = (M.__stopEpoch or 0) + 1
+
+    unequipAllAutoKG()
+end
+
+
+function M.IsRunning()
+    return running
+end
+
+function M.SetDebug(on, level)
+    GBXP_DEBUG  = (on == true)
+    DEBUG_LEVEL = level or DEBUG_LEVEL
+end
+
+-- simpan ke global dulu
+_G.AutoKGLoop = M
+
+
+M.__token = token
+G[LOOP_TOKEN_ATTR] = token
+
+task.spawn(function()
+    mainLoop(token)
+end)
+
+
+
+
+return M

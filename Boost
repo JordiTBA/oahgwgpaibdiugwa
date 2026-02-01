@@ -1,0 +1,308 @@
+-- boost.lua
+-- Auto apply PetBoost item ke pet AKTIF
+-- Filter:
+--   â€¢ SELECTED_PET_TYPES  â†’ pet-type yang di-boost (kosong = ALL)
+--   â€¢ PETBOOST_SELECTED  â†’ daftar PetBoost (UUID) yang dipakai
+-- TANPA cek PASSIVE_BOOST
+-- Interval pakai AUTO_BOOST_DELAY (default 20)
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local LP = Players.LocalPlayer
+
+local ActivePetsService = require(
+    ReplicatedStorage.Modules.PetServices.ActivePetsService
+)
+
+local ge = ReplicatedStorage:FindFirstChild("GameEvents")
+        or ReplicatedStorage:FindFirstChild("gameEvents")
+
+local PetBoostRE = ge and ge:FindFirstChild("PetBoostService")
+
+----------------------------------------------------------------
+-- CONFIG & DEBUG
+----------------------------------------------------------------
+local DEFAULT_DELAY       = 20
+local AUTO_BOOST_RUNNING  = false
+local AUTO_BOOST_THREAD   = nil
+local STOP_TOKEN          = 0
+
+local DEBUG_BOOST = false
+
+local function bprint(...)
+    if DEBUG_BOOST then
+        print("[AutoKGBoost]", ...)
+    end
+end
+
+local function bwarn(...)
+    if DEBUG_BOOST then
+        warn("[AutoKGBoost]", ...)
+    end
+end
+
+----------------------------------------------------------------
+-- UUID helpers
+----------------------------------------------------------------
+local function normalizeUUID(u)
+    if not u then return nil, nil end
+    local core = tostring(u):match("{?([0-9a-fA-F%-]+)}?") or tostring(u)
+    return core, "{" .. core .. "}"
+end
+
+----------------------------------------------------------------
+-- Unequip semua tools di character
+----------------------------------------------------------------
+local function unequipAllTools()
+    local char     = LP.Character
+    local backpack = LP:FindFirstChild("Backpack") or LP.Backpack
+    if not char or not backpack then return end
+
+    for _, inst in ipairs(char:GetChildren()) do
+        if inst:IsA("Tool") then
+            inst.Parent = backpack
+        end
+    end
+end
+
+----------------------------------------------------------------
+-- Cari boost tool di Backpack berdasarkan UUID
+----------------------------------------------------------------
+local function findBoostToolByUUID(boostUUID)
+    if not boostUUID then return nil end
+
+    local boostCore = select(1, normalizeUUID(boostUUID))
+    if not boostCore then return nil end
+
+    local backpack = LP:FindFirstChild("Backpack") or LP.Backpack
+    if not backpack then return nil end
+
+    for _, tool in ipairs(backpack:GetChildren()) do
+        if tool:IsA("Tool") then
+            local attr = tool:GetAttribute("c") or tool:GetAttribute("C")
+            if attr then
+                local attrCore = select(1, normalizeUUID(attr))
+                if attrCore == boostCore then
+                    return tool
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+local function equipTool(tool)
+    local char = LP.Character
+    if not char or not tool then return false end
+
+    unequipAllTools()
+    tool.Parent = char
+    task.wait(0.4)
+    return true
+end
+
+----------------------------------------------------------------
+-- Pet type filter
+----------------------------------------------------------------
+local function buildSelectedPetTypeMap()
+    local map = _G.SELECTED_PET_TYPES or SELECTED_PET_TYPES or {}
+
+    local hasAny = false
+    for _, enabled in pairs(map) do
+        if enabled then
+            hasAny = true
+            break
+        end
+    end
+
+    if not hasAny then
+        return nil -- ALL
+    end
+
+    local out = {}
+    for petName, enabled in pairs(map) do
+        if enabled then
+            out[tostring(petName):lower()] = true
+        end
+    end
+    return out
+end
+
+----------------------------------------------------------------
+-- Ambil active pets sesuai filter
+----------------------------------------------------------------
+local function getActivePetsFiltered()
+    local out = {}
+
+    local cps = ActivePetsService.ClientPetState
+    if type(cps) ~= "table" then return out end
+
+    local perPlayer = cps[LP] or cps[LP.UserId] or cps[LP.Name]
+    if type(perPlayer) ~= "table" then return out end
+
+    local selectedMap = buildSelectedPetTypeMap()
+
+    for uuidKey, handlers in pairs(perPlayer) do
+        if type(handlers) == "table" then
+            local rec = handlers.PetModelHandler
+                    or handlers.PetVFXHandler
+                    or handlers.PetSoundHandler
+
+            if type(rec) == "table" then
+                local pd = rec.PetData or rec.Data or {}
+                local pt = pd.PetType or rec.PetType or rec.Name
+
+                local petTypeName  = pt and tostring(pt) or ""
+                local petTypeLower = petTypeName:lower()
+
+                local allowed = (selectedMap == nil) or selectedMap[petTypeLower]
+                if allowed then
+                    local core, braced = normalizeUUID(rec.UUID or uuidKey)
+                    table.insert(out, {
+                        uuidCore   = core,
+                        uuidBraced = braced,
+                        petType    = petTypeName,
+                    })
+                end
+            end
+        end
+    end
+
+    return out
+end
+
+----------------------------------------------------------------
+-- Ambil boost UUID terpilih
+----------------------------------------------------------------
+local function getSelectedBoostUUIDs()
+    local list = {}
+    local src = _G.PETBOOST_SELECTED or PETBOOST_SELECTED
+
+    if type(src) ~= "table" then
+        return list
+    end
+
+    for uuid, enabled in pairs(src) do
+        if enabled then
+            table.insert(list, uuid)
+        end
+    end
+
+    return list
+end
+
+----------------------------------------------------------------
+-- APPLY BOOST SEKALI (TANPA PASSIVE CHECK)
+-- + bisa diputus cepat kalau STOP (token berubah / running false)
+----------------------------------------------------------------
+local function applyAutoBoostOnce(myToken)
+    if not PetBoostRE then return false end
+    if (not AUTO_BOOST_RUNNING) or (myToken ~= STOP_TOKEN) then return false end
+
+    local boostUUIDs = getSelectedBoostUUIDs()
+    if #boostUUIDs == 0 then return false end
+
+    local pets = getActivePetsFiltered()
+    if #pets == 0 then return false end
+
+    local usedAny = false
+
+    for _, info in ipairs(pets) do
+        if (not AUTO_BOOST_RUNNING) or (myToken ~= STOP_TOKEN) then break end
+
+        local uuidBraced = info.uuidBraced
+        local petType    = info.petType or "?"
+
+        bprint("Boost pet:", petType, uuidBraced)
+
+        for _, boostUUID in ipairs(boostUUIDs) do
+            if (not AUTO_BOOST_RUNNING) or (myToken ~= STOP_TOKEN) then break end
+
+            local tool = findBoostToolByUUID(boostUUID)
+            if tool and equipTool(tool) then
+                if (not AUTO_BOOST_RUNNING) or (myToken ~= STOP_TOKEN) then
+                    unequipAllTools()
+                    break
+                end
+
+                task.wait(0.2)
+
+                local ok = pcall(function()
+                    PetBoostRE:FireServer("ApplyBoost", uuidBraced)
+                end)
+
+                if ok then
+                    usedAny = true
+                    bprint("ApplyBoost OK:", uuidBraced, tool.Name)
+                end
+
+                task.wait(0.2)
+                unequipAllTools()
+            end
+        end
+    end
+
+    return usedAny
+end
+
+----------------------------------------------------------------
+-- PUBLIC MODULE
+----------------------------------------------------------------
+local M = {}
+
+function M.isRunning()
+    return AUTO_BOOST_RUNNING
+end
+
+function M.setDelay(v)
+    local n = tonumber(v)
+    if not n or n <= 0 then return end
+    n = math.floor(n + 0.5) -- rapihin
+    AUTO_BOOST_DELAY = n
+    _G.AUTO_BOOST_DELAY = n
+end
+
+function M.stop()
+    AUTO_BOOST_RUNNING = false
+    STOP_TOKEN += 1           -- âœ… matikan loop yang sedang jalan
+    AUTO_BOOST_THREAD  = nil
+    pcall(unequipAllTools)    -- âœ… bersih
+end
+
+function M.start()
+    if AUTO_BOOST_RUNNING then return end
+    AUTO_BOOST_RUNNING = true
+
+    local myToken = STOP_TOKEN
+
+    AUTO_BOOST_THREAD = task.spawn(function()
+        while AUTO_BOOST_RUNNING and (myToken == STOP_TOKEN) do
+            pcall(applyAutoBoostOnce, myToken)
+
+            local delay = tonumber(_G.AUTO_BOOST_DELAY or AUTO_BOOST_DELAY) or DEFAULT_DELAY
+            delay = math.max(delay, 1)
+
+            local t = delay
+            while t > 0 and AUTO_BOOST_RUNNING and (myToken == STOP_TOKEN) do
+                task.wait(1)
+                t -= 1
+            end
+        end
+    end)
+end
+
+function M.syncFromState()
+    local d = tonumber(_G.AUTO_BOOST_DELAY or AUTO_BOOST_DELAY) or DEFAULT_DELAY
+    M.setDelay(d)
+
+    if AUTO_BOOST_ENABLED == true then
+        M.start()
+    else
+        M.stop()
+    end
+end
+
+_G.AutoKGBoost = M
+return M

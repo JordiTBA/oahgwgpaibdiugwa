@@ -1,0 +1,535 @@
+-- autoaccept.lua
+-- Auto Accept Gift + Trade untuk NodeHub
+-- Baca toggle dari GIFT_CFG.autoAcceptGift & GIFT_CFG.autoAcceptTrade (state.lua + misc.lua)
+
+--------------------------------------------------
+-- Services & Globals
+--------------------------------------------------
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace         = game:GetService("Workspace")
+
+local RS = ReplicatedStorage
+local LP = Players.LocalPlayer
+
+local G = (getgenv and getgenv()) or _G
+
+--------------------------------------------------
+-- Helper: Ambil GIFT_CFG Global
+--------------------------------------------------
+local function getGiftCfg()
+    -- coba beberapa nama, tergantung kamu assign di mana
+    local cfg = rawget(G, "GIFT_CFG")
+        or G.GIFT_CFG
+        or rawget(_G, "GIFT_CFG")
+        or _G.GIFT_CFG
+        or rawget(_G, "giftCfg")
+        or _G.giftCfg
+        or _G.GIFT_CONFIG
+        or GIFT_CFG
+
+    if typeof(cfg) ~= "table" then
+        return nil
+    end
+    return cfg
+end
+
+local function isAutoGiftOn()
+    local cfg = getGiftCfg()
+    return cfg and cfg.autoAcceptGift == true
+end
+
+local function isAutoTradeOn()
+    local cfg = getGiftCfg()
+    return cfg and cfg.autoAcceptTrade == true
+end
+
+--------------------------------------------------
+-- 1) AUTO ACCEPT GIFT
+--------------------------------------------------
+local CLEAR_WINDOW_SEC   = 3      -- berapa lama bersihin notif gift
+local CLEAR_INTERVAL_SEC = 0.25   -- interval cek UI notif
+
+local okGift, giftErr = pcall(function()
+    local GameEvents = RS:WaitForChild("GameEvents")
+    local GiftPet    = GameEvents:WaitForChild("GiftPet")
+    local AcceptGift = GameEvents:WaitForChild("AcceptPetGift")
+
+    GiftPet.OnClientEvent:Connect(function(uuid, petName, fromPlayer)
+        -- cek toggle dari GIFT_CFG
+        if not isAutoGiftOn() then
+            return
+        end
+
+        -- Auto accept gift langsung ke server
+        AcceptGift:FireServer(true, uuid)
+
+        -- Bersihkan notifikasi "Gift_Notification" biar layar bersih
+        task.spawn(function()
+            local playerGui = LP:WaitForChild("PlayerGui")
+            local deadline  = tick() + CLEAR_WINDOW_SEC
+
+            while tick() < deadline do
+                local root = playerGui:FindFirstChild("Gift_Notification")
+                if root then
+                    local frame = root:FindFirstChild("Frame")
+                    if frame then
+                        local inner = frame:FindFirstChild("Gift_Notification")
+                        if inner then
+                            inner:Destroy()
+                        end
+                    end
+                end
+
+                task.wait(CLEAR_INTERVAL_SEC)
+            end
+        end)
+    end)
+end)
+
+if not okGift then
+    warn("[AutoAccept] Gagal inisialisasi Auto Accept Gift:", giftErr)
+end
+
+--------------------------------------------------
+-- 2) AUTO ACCEPT TRADE (FULL)
+--------------------------------------------------
+local DEBUG          = false
+local TIMEOUT_READY  = 200
+local TIMEOUT_ACTION = 200
+
+local function dbg(...)
+    if DEBUG then
+        print("[TradeRecvDBG]", ...)
+    end
+end
+
+local function warnx(...)
+    warn("[TradeRecvDBG]", ...)
+end
+
+--------------------------------------------------
+-- Safe require helper
+--------------------------------------------------
+local function safeRequire(obj)
+    local ok, mod = pcall(function()
+        return require(obj)
+    end)
+    if not ok then
+        dbg("require fail:", tostring(obj))
+    end
+    return ok and mod or nil
+end
+
+--------------------------------------------------
+-- Ambil TradeEvents & Modules
+--------------------------------------------------
+local TradeEvents
+local SendRequestEv, RespondRequestEv, AcceptEv, ConfirmEv, DeclineEv, UpdateState
+local ReplicationReciever
+local TradeData
+
+local TRADE_SYSTEM_OK = false
+
+do
+    local okTrade, err = pcall(function()
+        local GE = RS:WaitForChild("GameEvents")
+        TradeEvents      = GE:WaitForChild("TradeEvents")
+
+        SendRequestEv    = TradeEvents:WaitForChild("SendRequest")
+        RespondRequestEv = TradeEvents:WaitForChild("RespondRequest")
+        AcceptEv         = TradeEvents:WaitForChild("Accept")
+        ConfirmEv        = TradeEvents:WaitForChild("Confirm")
+        DeclineEv        = TradeEvents:WaitForChild("Decline")
+        UpdateState      = TradeEvents:WaitForChild("UpdateTradeState")
+
+        local modules = RS:WaitForChild("Modules")
+        ReplicationReciever = safeRequire(modules:WaitForChild("ReplicationReciever"))
+
+        local dataFolder = RS:WaitForChild("Data")
+        TradeData = safeRequire(dataFolder:WaitForChild("TradeData")) or { ButtonCooldown = 0 }
+
+        if not ReplicationReciever then
+            error("ReplicationReciever module tidak ditemukan")
+        end
+    end)
+
+    if not okTrade then
+        warnx("Inisialisasi TradeEvents gagal, auto-accept trade dimatikan:", err)
+        TRADE_SYSTEM_OK = false
+    else
+        TRADE_SYSTEM_OK = true
+    end
+end
+
+if not TRADE_SYSTEM_OK then
+    -- Jangan return seluruh file, biarkan Auto Gift tetap jalan.
+    dbg("Trade system tidak siap, bagian auto-accept trade skip.")
+end
+
+--------------------------------------------------
+-- Trade replicator state & helper
+--------------------------------------------------
+local player        = LP
+local currentTradeId = nil
+local replicator     = nil
+
+-- dapatkan states, index-ku, dan index lawan
+local function getStateIndices()
+    if not replicator then return nil end
+
+    local ok, data = pcall(function()
+        return replicator:GetData()
+    end)
+    if not ok or not data then
+        return nil
+    end
+
+    local players = data.players or {}
+    local states  = data.states  or {}
+    local myIdx
+
+    for i, p in ipairs(players) do
+        if p == player then
+            myIdx = i
+            break
+        end
+    end
+    if not myIdx then
+        return nil
+    end
+
+    local otherIdx = (myIdx == 1) and 2 or 1
+    return states, myIdx, otherIdx
+end
+
+-- true kalau lawan sudah Accepted
+local function otherAccepted()
+    local states, myIdx, otherIdx = getStateIndices()
+    if not states or not myIdx or not otherIdx then
+        return false
+    end
+    local myState    = states[myIdx]
+    local otherState = states[otherIdx]
+
+    if otherState == "Accepted" then
+        return true, ("other=%s my=%s"):format(tostring(otherState), tostring(myState))
+    end
+
+    return false, ("other=%s my=%s"):format(tostring(otherState), tostring(myState))
+end
+
+-- true kalau lawan sudah Confirmed
+local function otherConfirmed()
+    local states, myIdx, otherIdx = getStateIndices()
+    if not states or not myIdx or not otherIdx then
+        return false
+    end
+    local myState    = states[myIdx]
+    local otherState = states[otherIdx]
+
+    if otherState == "Confirmed" then
+        return true, ("other=%s my=%s"):format(tostring(otherState), tostring(myState))
+    end
+
+    return false, ("other=%s my=%s"):format(tostring(otherState), tostring(myState))
+end
+
+local function waitUntil(pred, timeout)
+    local t0    = os.clock()
+    local limit = timeout or 10
+    while os.clock() - t0 < limit do
+        local ok, why = pred()
+        if ok then
+            return true, why
+        end
+        RunService.Heartbeat:Wait()
+    end
+    return false, "timeout"
+end
+
+-- cooldown dari TradeData (pakai data replicator)
+local function cooldownSatisfied()
+    if not replicator then
+        return false
+    end
+
+    local ok, data = pcall(function()
+        return replicator:GetData()
+    end)
+    if not ok or not data then
+        return false
+    end
+
+    local delta = Workspace:GetServerTimeNow() - (data.lastChange or 0)
+    local cd    = tonumber(TradeData.ButtonCooldown) or 0
+    return delta >= cd, string.format("delta=%.3f cd=%.3f", delta, cd)
+end
+
+-- baca offer milik kita dari replicator
+local function getMyOffer()
+    if not replicator then return nil end
+
+    local ok, data = pcall(function()
+        return replicator:GetData()
+    end)
+    if not ok or not data then
+        return nil
+    end
+
+    local idx
+    for i, p in ipairs(data.players or {}) do
+        if p == player then
+            idx = i
+            break
+        end
+    end
+    if not idx then
+        return nil
+    end
+
+    local bucket = (data.offers and data.offers[idx]) or {}
+    return {
+        items    = bucket.items or {},
+        sheckles = bucket.sheckles or 0,
+        states   = data.states,
+        players  = data.players,
+    }
+end
+
+-- tunggu kedua pihak Accepted
+local function bothAccepted()
+    local o = getMyOffer()
+    if not o then
+        return false
+    end
+
+    local players, states = o.players or {}, o.states or {}
+    local myIdx
+    for i, p in ipairs(players) do
+        if p == player then
+            myIdx = i
+            break
+        end
+    end
+    if not myIdx or not states then
+        return false
+    end
+
+    local otherIdx = (myIdx == 1) and 2 or 1
+    if not states[myIdx] or not states[otherIdx] then
+        return false
+    end
+
+    return (states[myIdx] == "Accepted" and states[otherIdx] == "Accepted"), "both-accepted"
+end
+
+-- nunggu trade bener2 mulai (replicator + data siap)
+local function waitTradeStarted(timeout)
+    return waitUntil(function()
+        if not currentTradeId or not replicator then
+            return false
+        end
+        local o = getMyOffer()
+        if o then
+            return true, "trade-started"
+        end
+        return false
+    end, timeout or TIMEOUT_READY)
+end
+
+-- nunggu trade berakhir (UpdateState kirim nil)
+local function waitTradeEnded(timeout)
+    return waitUntil(function()
+        if not currentTradeId or not replicator then
+            return true, "trade-ended"
+        end
+        return false
+    end, timeout or TIMEOUT_ACTION)
+end
+
+--------------------------------------------------
+-- FUNGSI UTAMA: Auto Accept + Confirm sekali jalan
+--------------------------------------------------
+local function runAutoAcceptOnce()
+    -- kalau user matikan toggle di tengah-tengah, jangan lanjut
+    if not isAutoTradeOn() then
+        dbg("runAutoAcceptOnce dipanggil tapi autoAcceptTrade = false, batal.")
+        return false
+    end
+
+    dbg("runAutoAcceptOnce: menunggu trade aktif...")
+
+    -- 1) tunggu trade + data siap
+    local okStart, whyStart = waitTradeStarted(TIMEOUT_READY)
+    if not okStart then
+        warnx("trade tidak aktif / replicator tidak siap:", whyStart)
+        return false
+    end
+    dbg("Trade terdeteksi, replicator siap")
+
+    -- 2) (opsional) cek offer lawan / kita sendiri (anti-scam bisa ditaruh di sini)
+    local offer = getMyOffer()
+    if offer then
+        dbg(string.format(
+            "Offer sekarang: items=%d, sheckles=%s",
+            #(offer.items or {}), tostring(offer.sheckles or 0)
+        ))
+        -- TODO: kalau mau, di sini tambahkan filter minimal sheckles / minimal item dll.
+    else
+        warnx("getMyOffer() gagal, lanjut saja...")
+    end
+
+    ------------------------------------------------------------
+    -- 3) ACCEPT: tunggu lawan ACCEPT dulu baru kita Accept
+    ------------------------------------------------------------
+    dbg("Menunggu lawan Accepted dulu sebelum kita Accept...")
+    local okOtherAcc, whyOtherAcc = waitUntil(otherAccepted, TIMEOUT_ACTION)
+    if not okOtherAcc then
+        warnx("Lawan tidak Accepted dalam waktu limit:", whyOtherAcc)
+        -- fallback: tetap coba Accept biar trade nggak macet
+    else
+        dbg("Lawan sudah Accepted:", whyOtherAcc)
+    end
+
+    dbg("Menunggu cooldown sebelum Accept...")
+    waitUntil(cooldownSatisfied, TIMEOUT_ACTION)
+
+    dbg("AcceptEv:FireServer() (penerima)")
+    pcall(function()
+        AcceptEv:FireServer()
+    end)
+
+    -- pastikan kedua pihak sudah Accepted
+    dbg("Menunggu kedua pemain Accepted...")
+    local okBoth, whyBoth = waitUntil(bothAccepted, TIMEOUT_ACTION)
+    if not okBoth then
+        warnx("BothAccepted timeout / gagal:", whyBoth)
+        return false
+    end
+    dbg("Kedua pemain Accepted, siap masuk fase Confirm")
+
+    ------------------------------------------------------------
+    -- 4) CONFIRM: tunggu lawan CONFIRM dulu baru kita Confirm
+    ------------------------------------------------------------
+    dbg("Menunggu lawan Confirm dulu sebelum kita Confirm...")
+    local okOtherConf, whyOtherConf = waitUntil(otherConfirmed, TIMEOUT_ACTION)
+    if not okOtherConf then
+        warnx("Lawan belum Confirm (timeout):", whyOtherConf)
+        -- kalau mau lebih aman, bisa return false di sini:
+        -- return false
+    else
+        dbg("Lawan sudah Confirm:", whyOtherConf)
+    end
+
+    dbg("Menunggu cooldown sebelum Confirm...")
+    waitUntil(cooldownSatisfied, TIMEOUT_ACTION)
+
+    dbg("ConfirmEv:FireServer() (penerima)")
+    pcall(function()
+        ConfirmEv:FireServer()
+    end)
+
+    ------------------------------------------------------------
+    -- 5) tunggu trade benar-benar selesai
+    ------------------------------------------------------------
+    dbg("Menunggu trade selesai (trade-ended)...")
+    local okEnd, whyEnd = waitTradeEnded(TIMEOUT_ACTION)
+    if not okEnd then
+        warnx("Trade belum selesai (timeout):", whyEnd)
+        return false
+    end
+
+    dbg("Trade selesai (confirmed & UpdateState nil)")
+    return true
+end
+
+--------------------------------------------------
+-- Event binding ONLY kalau Trade system siap
+--------------------------------------------------
+if TRADE_SYSTEM_OK then
+    ------------------------------------------------------
+    -- 2.1) AUTO RESPOND REQUEST (tanpa klik tombol UI)
+    ------------------------------------------------------
+    SendRequestEv.OnClientEvent:Connect(function(tradeId, fromPlayer, expireAt)
+        local remaining = (expireAt or 0) - Workspace:GetServerTimeNow()
+        dbg(("Incoming trade request dari %s | tradeId=%s | sisa=%.2fs")
+            :format(fromPlayer and fromPlayer.Name or "?", tostring(tradeId), remaining))
+
+        -- cek toggle auto-accept trade
+        if not isAutoTradeOn() then
+            dbg("autoAcceptTrade = false â†’ cuma log, tidak auto RespondRequest")
+            return
+        end
+
+        if not tradeId then
+            warnx("tradeId nil, tidak bisa RespondRequest")
+            return
+        end
+
+        -- setara dengan pencet tombol ACCEPT di UI asli
+        pcall(function()
+            RespondRequestEv:FireServer(tradeId, true)
+        end)
+        dbg("RespondRequestEv:FireServer(tradeId, true) (auto-accept undangan)")
+    end)
+
+    ------------------------------------------------------
+    -- 2.2) HOOK UpdateTradeState â†’ pasang replicator & autoAccept
+    ------------------------------------------------------
+    UpdateState.OnClientEvent:Connect(function(tradeId)
+        dbg("UpdateTradeState:", tradeId)
+
+        -- bersihkan replicator lama
+        if replicator then
+            pcall(function()
+                replicator:Destroy()
+            end)
+            replicator = nil
+        end
+
+        currentTradeId = tradeId
+
+        if tradeId then
+            -- buat replicator baru
+            local ok, rep = pcall(function()
+                return ReplicationReciever.new(tradeId)
+            end)
+            if ok and rep then
+                replicator = rep
+                dbg("Replicator baru ready")
+
+                if isAutoTradeOn() then
+                    task.defer(function()
+                        task.wait(0.3) -- sedikit delay biar data sempat sync
+                        runAutoAcceptOnce()
+                    end)
+                else
+                    dbg("UpdateState: autoAcceptTrade = false, tidak jalankan runAutoAcceptOnce()")
+                end
+            else
+                warnx("ReplicationReciever.new() gagal:", rep)
+            end
+        else
+            dbg("TradeState = nil (trade selesai / dibatalkan)")
+        end
+    end)
+
+    dbg("Auto-accept trade siap. Toggle dikontrol GIFT_CFG.autoAcceptTrade")
+end
+
+--------------------------------------------------
+-- Optional return (kalau dipakai sebagai ModuleScript)
+--------------------------------------------------
+local M = {}
+
+function M.IsAutoGiftOn()
+    return isAutoGiftOn()
+end
+
+function M.IsAutoTradeOn()
+    return isAutoTradeOn()
+end
+
+return M

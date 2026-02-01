@@ -1,0 +1,1241 @@
+-- state.lua
+
+task.wait(5)
+local Players     = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+
+-- ðŸ”¹ GLOBAL ENV
+local G = (getgenv and getgenv()) or _G
+-- pastikan STATE table ada (biar module baca 1 sumber)
+G.STATE = (type(G.STATE) == "table") and G.STATE or {}
+local STATE = G.STATE
+_G.STATE = STATE  -- mirror
+
+--------------------------------------------------
+-- 1) DEFAULT GLOBALS / STATE
+--------------------------------------------------
+
+AUTO_GIFT_ENABLED = AUTO_GIFT_ENABLED or false
+
+if G.AUTO_ACCEPT_ENABLED == nil then
+    G.AUTO_ACCEPT_ENABLED = false
+end
+AUTO_ACCEPT_ENABLED = G.AUTO_ACCEPT_ENABLED
+
+selected = selected or {
+  boost = {}, xp = {}, noos = {}, seratusage = {}, gbxp = {}
+}
+local selected = selected  -- optional: local alias yang menunjuk global
+
+
+-- MUTASI GBXP
+GBXP_MUT_SELECTED = GBXP_MUT_SELECTED or {
+    ["Nightmare"]   = true,
+    ["JUMBO"]       = true,
+    ["Mega"]        = true,
+    ["Tethered"]    = true,
+    ["Rainbow"]     = true,
+    ["HyperHunger"] = true,
+}
+
+AUTOKG_MUTATION_ENABLED = (AUTOKG_MUTATION_ENABLED == nil) and false or AUTOKG_MUTATION_ENABLED
+AUTO_BOOST_ENABLED     = (AUTO_BOOST_ENABLED == nil) and false or AUTO_BOOST_ENABLED
+AUTO_BOOST_DELAY = AUTO_BOOST_DELAY or 20
+
+
+AUTO_FEED_ENABLED         = (AUTO_FEED_ENABLED == true)
+AUTO_FEED_HUNGER_UNDER       = tonumber(AUTO_FEED_HUNGER_UNDER) or 1000
+AUTO_FEED_PETS_SELECTED   = AUTO_FEED_PETS_SELECTED or {}      -- map uuid/nama -> true (sesuai item key)
+AUTO_FEED_FRUITS_SELECTED = AUTO_FEED_FRUITS_SELECTED or {}    -- map fruit -> true
+AUTO_COLLECT_FRUIT_ENABLED = (AUTO_COLLECT_FRUIT_ENABLED == true)
+-- AUTO BUY (NEW)
+AUTO_BUY_SEED_ENABLED = (AUTO_BUY_SEED_ENABLED == nil) and false or AUTO_BUY_SEED_ENABLED
+AUTO_BUY_EGG_ENABLED  = (AUTO_BUY_EGG_ENABLED  == nil) and false or AUTO_BUY_EGG_ENABLED
+AUTO_BUY_GEAR_ENABLED = (AUTO_BUY_GEAR_ENABLED == nil) and false or AUTO_BUY_GEAR_ENABLED
+-- state.lua
+AUTO_RECONNECT_ENABLED   = (AUTO_RECONNECT_ENABLED   == nil) and false or AUTO_RECONNECT_ENABLED
+AUTO_START_ON_REJOIN     = (AUTO_START_ON_REJOIN     == nil) and false or AUTO_START_ON_REJOIN  -- Auto Exec
+AUTO_START_KG_ON_REJOIN  = (AUTO_START_KG_ON_REJOIN  == nil) and false or AUTO_START_KG_ON_REJOIN -- Auto Start KG
+
+AUTO_OPEN_RBLX_ENABLED   = (AUTO_OPEN_RBLX_ENABLED == true)
+AUTO_OPEN_RBLX_MODE      = AUTO_OPEN_RBLX_MODE or "mode1"
+AUTO_OPEN_RBLX_LINK      = AUTO_OPEN_RBLX_LINK or ""
+AUTO_OPEN_RBLX_OPEN_MIN  = tonumber(AUTO_OPEN_RBLX_OPEN_MIN)  or 30
+AUTO_OPEN_RBLX_CLOSE_MIN = tonumber(AUTO_OPEN_RBLX_CLOSE_MIN) or 1
+
+
+SEED_SELECTED = SEED_SELECTED or {}  -- map: [seedName/id]=true
+EGG_SELECTED  = EGG_SELECTED  or {}  -- map: [eggName]=true
+GEAR_SELECTED = GEAR_SELECTED or {}  -- map: [gearName/id]=true
+
+--------------------------------------------------
+-- DEFAULT CONFIG GIFT (GLOBAL, tapi aman pakai or)
+--------------------------------------------------
+GIFT_CFG = GIFT_CFG or {
+    -- ROW 1
+    enabled   = false,
+    targets   = {},   -- map: { [targetId] = true }
+    minKG     = 0,
+    minAge    = 0,
+    petType   = {},   -- map: { [petType] = true }
+
+    -- ROW 2
+    enabledB  = false,
+    targetsB  = {},
+    minKGB    = 0,
+    minAgeB   = 0,
+    petTypeB  = {},
+
+    -- ROW 3
+    enabledC  = false,
+    targetsC  = {},
+    minKGC    = 0,
+    minAgeC   = 0,
+    petTypeC  = {},
+    
+    mut       = {},   -- Gift 1
+    mutB      = {},   -- Gift 2
+    mutC      = {},   -- Gift 3
+
+    -- AUTO ACCEPT
+    autoAcceptTrade = false,
+    autoAcceptGift  = false,
+}
+
+GIFT_MUT_SELECTED = GIFT_MUT_SELECTED or {}  -- [mutName] = true
+
+SELECTED_PET_TYPES = SELECTED_PET_TYPES or {}
+PETBOOST_SELECTED  = PETBOOST_SELECTED  or {}
+
+activeTab = activeTab or "noos"
+
+GBXP_STAGE_MODE = GBXP_STAGE_MODE 
+
+
+TAB_AGE_EQUIP_MIN = TAB_AGE_EQUIP_MIN or {
+    noos       = 40,
+    boost      = 20,
+    seratusage = 40,
+    xp         = -40,
+    gbxp       = 0,
+}
+
+TAB_AGE_UNEQUIP_MIN = TAB_AGE_UNEQUIP_MIN or {
+    noos       = 0,
+    boost      = 40,
+    seratusage = 100,
+    xp         = 40,
+    gbxp       = 100,
+}
+
+TAB_W_EQUIP_MIN = TAB_W_EQUIP_MIN or {
+    boost      = 0,
+    xp         = 0,
+    noos       = -60.45,
+    seratusage =  60.45,
+    gbxp       = 0,
+}
+
+TAB_W_UNEQUIP_MAX = TAB_W_UNEQUIP_MAX or {
+    boost      = 0,
+    xp         = 0,
+    noos       = 60.45,
+    seratusage = 0,
+    gbxp       = 0,
+}
+
+GBXP_MAX_EQUIP = GBXP_MAX_EQUIP or 2
+
+GBXP_TYPE_WHITELIST = GBXP_TYPE_WHITELIST or {
+    -- ... isi kamu nantinya ...
+}
+
+-- SWAP SKILL (STATE)
+swap_skill = swap_skill or {
+    enabled      = false,
+    selected     = {},   -- map uuid -> true
+    order        = {},   -- array uuid
+    delays       = {},   -- map uuid -> { unequipAfterReady=number, equipNext=number }
+    poll         = 0.25,
+    scanInterval = 0.1,
+}
+
+-- bridge: global swap_skill -> STATE.swap_skill
+STATE.swap_skill = (type(STATE.swap_skill) == "table") and STATE.swap_skill or swap_skill
+
+-- pastikan referensinya sama (1 object)
+swap_skill = STATE.swap_skill
+G.swap_skill = swap_skill
+
+
+
+function setGBXPStageMode(mode)
+    mode = tostring(mode or "auto")
+
+    mode = mode:gsub("%s+", ""):gsub(",", "")
+    local upper = mode:upper()
+
+    if upper == "AUTO" then
+        GBXP_STAGE_MODE = "auto"
+    elseif upper == "A" or upper == "B" or upper == "C" or upper == "D" then
+        GBXP_STAGE_MODE = upper
+    elseif upper == "BC" or upper == "CB" or upper == "CD" or upper == "DC" then
+        GBXP_STAGE_MODE = upper
+    elseif upper == "CAD" then
+        GBXP_STAGE_MODE = upper
+    else
+        --warn("[GBXP] mode stage invalid:", mode, "pakai: auto / A / B / C / D / BC / CD / CAD")
+        return
+    end
+
+    CURRENT_STAGE     = nil
+    LAST_TARGET_UUID  = nil
+    LAST_MODE         = nil
+    __RESUME_REAPPLY  = true
+end
+
+
+--------------------------------------------------
+-- 2) PERSISTENCE (SAVE_DIR, _safeName, save/load)
+--------------------------------------------------
+local SAVE_TABS = { boost=true, noos=true, xp=true , seratusage=true }
+local CAN_FS = (typeof(writefile)=="function" and typeof(readfile)=="function"
+             and typeof(isfile)=="function" and typeof(makefolder)=="function")
+
+local SAVE_DIR = "autosk"
+
+-- Sanitisasi username biar aman untuk nama file
+local function _safeName(s)
+    s = tostring(s or "player")
+    -- izinkan huruf/angka/underscore/dash/dot; lainnya diganti "_"
+    s = s:gsub("[^%w%-_.]", "_")
+    -- rapikan underscore berulang
+    s = s:gsub("_+", "_")
+    -- batasi panjang kalau perlu
+    return s:sub(1, 48)
+end
+
+local function _ensureFolder()
+    if not CAN_FS then return false end
+    if not isfolder(SAVE_DIR) then pcall(makefolder, SAVE_DIR) end
+    return isfolder(SAVE_DIR)
+end
+
+-- Pakai username (disarankan tetap gabung PlaceId supaya per-game)
+local USERNAME_KEY = _safeName(Players.LocalPlayer.Name)
+local SAVE_FILE = ("%s/%s.json"):format(SAVE_DIR, USERNAME_KEY)
+
+
+-- (Opsional) migrasi dari format lama (berbasis userId) ke username-berkas jika ada
+local OLD_SAVE_FILE = ("%s/%d_%d.json"):format(SAVE_DIR, game.PlaceId, Players.LocalPlayer.UserId)
+pcall(function()
+    if CAN_FS and _ensureFolder() and (not isfile(SAVE_FILE)) and isfile(OLD_SAVE_FILE) then
+        local ok, txt = pcall(readfile, OLD_SAVE_FILE)
+        if ok and type(txt)=="string" and #txt > 0 then
+            pcall(writefile, SAVE_FILE, txt)
+            -- kalau ingin menghapus berkas lama dan executor mendukung delfile, kamu bisa:
+            -- if typeof(delfile)=="function" then pcall(delfile, OLD_SAVE_FILE) end
+        end
+    end
+end)
+
+-- Utility kecil agar hanya simpan entry yang true
+-- Utility kecil agar hanya simpan entry yang true
+local function _cleanSet(setTbl)
+    if type(setTbl) ~= "table" then return {} end
+    local out = {}
+    for k,v in pairs(setTbl) do if v == true then out[k] = true end end
+    return out
+end
+
+local function _cleanArray(arr)
+    if type(arr) ~= "table" then return {} end
+    local out = {}
+    for i, v in ipairs(arr) do
+        if v ~= nil then out[#out+1] = tostring(v) end
+    end
+    return out
+end
+
+local function _cleanSwapDelays(delays)
+    if type(delays) ~= "table" then return {} end
+    local out = {}
+    for uuid, d in pairs(delays) do
+        if type(d) == "table" then
+            local a = tonumber(d.unequipAfterReady)
+            local b = tonumber(d.equipNext)
+            if a or b then
+                out[tostring(uuid)] = {
+                    unequipAfterReady = a,
+                    equipNext         = b,
+                }
+            end
+        end
+    end
+    return out
+end
+
+
+local function saveSelectionsToFile()
+    if not CAN_FS or not _ensureFolder() then return end
+
+    local payload = {
+        boost       = _cleanSet(selected.boost       or {}),
+        noos        = _cleanSet(selected.noos        or {}),
+        seratusage  = _cleanSet(selected.seratusage  or {}),
+        xp          = _cleanSet(selected.xp          or {}),
+
+        ages = {
+            equip   = TAB_AGE_EQUIP_MIN   or {},
+            unequip = TAB_AGE_UNEQUIP_MIN or {},
+        },
+    
+       kg = {
+            equip   = TAB_W_EQUIP_MIN   or {},
+            unequip = TAB_W_UNEQUIP_MAX or {},
+        },
+
+        gbxp_mut = GBXP_MUT_SELECTED or {},
+        
+        selected_pet_types = SELECTED_PET_TYPES or {},
+        petboost           = _cleanSet(PETBOOST_SELECTED or {}),
+        auto_boost_delay        = tonumber(AUTO_BOOST_DELAY) or 20,
+        
+                ----------------------------------------------------------------
+        -- AUTO BUY (NEW)
+        ----------------------------------------------------------------
+        auto_buy = {
+            seed_enabled = (AUTO_BUY_SEED_ENABLED == true),
+            egg_enabled  = (AUTO_BUY_EGG_ENABLED  == true),
+            gear_enabled = (AUTO_BUY_GEAR_ENABLED == true),
+
+            seed_selected = _cleanSet(SEED_SELECTED or {}),
+            egg_selected  = _cleanSet(EGG_SELECTED  or {}),
+            gear_selected = _cleanSet(GEAR_SELECTED or {}),
+        },
+    
+auto_feed = {
+    enabled      = (AUTO_FEED_ENABLED == true),
+
+    -- NEW
+    hunger_under = tonumber(AUTO_FEED_HUNGER_UNDER) or 60,
+
+    pets         = _cleanSet(AUTO_FEED_PETS_SELECTED or {}),
+    fruits       = _cleanSet(AUTO_FEED_FRUITS_SELECTED or {}),
+},
+
+    
+            ----------------------------------------------------------------
+        -- REJOIN SETTINGS (NEW)
+        ----------------------------------------------------------------
+rejoin = {
+    auto_reconnect = (AUTO_RECONNECT_ENABLED == true),
+    auto_exec      = (AUTO_START_ON_REJOIN == true),
+    auto_start_kg  = (AUTO_START_KG_ON_REJOIN == true),
+},
+
+        auto_open_rblx = {
+            enabled   = (AUTO_OPEN_RBLX_ENABLED == true),
+            mode      = AUTO_OPEN_RBLX_MODE or "mode1",
+            link      = AUTO_OPEN_RBLX_LINK or "",
+            open_min  = tonumber(AUTO_OPEN_RBLX_OPEN_MIN)  or 30,
+            close_min = tonumber(AUTO_OPEN_RBLX_CLOSE_MIN) or 1,
+        },
+
+swap_skill = {
+    enabled      = (swap_skill and swap_skill.enabled == true) or false,
+    selected     = _cleanSet((swap_skill and swap_skill.selected) or {}),
+    order        = _cleanArray((swap_skill and swap_skill.order) or {}),
+    delays       = _cleanSwapDelays((swap_skill and swap_skill.delays) or {}),
+    poll         = tonumber(swap_skill and swap_skill.poll) or 0.05,
+    scanInterval = tonumber(swap_skill and swap_skill.scanInterval) or 0.1,
+},
+
+
+        gift_cfg = {
+            ----------------------------------------------------------------
+            -- FORMAT BARU (UTAMA)
+            ----------------------------------------------------------------
+            -- TARGET (map atau struct, tergantung UI-mu)
+            targets   = GIFT_CFG.targets   or {},  -- group A
+            targetsB  = GIFT_CFG.targetsB  or {},  -- group B
+            targetsC  = GIFT_CFG.targetsC  or {},  -- group C
+
+            -- LIMIT KG / AGE
+            minKG     = tonumber(GIFT_CFG.minKG)   or 0,  -- A
+            minAge    = tonumber(GIFT_CFG.minAge)  or 0,
+            minKGB    = tonumber(GIFT_CFG.minKGB)  or 0,  -- B
+            minAgeB   = tonumber(GIFT_CFG.minAgeB) or 0,
+            minKGC    = tonumber(GIFT_CFG.minKGC)  or 0,  -- C
+            minAgeC   = tonumber(GIFT_CFG.minAgeC) or 0,
+
+            -- ENABLE PER ROW
+            enabled   = (GIFT_CFG.enabled  == true),
+            enabledB  = (GIFT_CFG.enabledB == true),
+            enabledC  = (GIFT_CFG.enabledC == true),
+
+            -- PET TYPE FILTER (map: [petName] = true)
+            petType   = _cleanSet(GIFT_CFG.petType   or {}),
+            petTypeB  = _cleanSet(GIFT_CFG.petTypeB  or {}),
+            petTypeC  = _cleanSet(GIFT_CFG.petTypeC  or {}),
+            
+                    -- ðŸ”¹ NEW: simpan mutasi per Gift
+            mut       = _cleanSet(GIFT_CFG.mut   or {}),
+            mutB      = _cleanSet(GIFT_CFG.mutB  or {}),
+            mutC      = _cleanSet(GIFT_CFG.mutC  or {}),
+
+            -- AUTO ACCEPT (NEW)
+            autoAcceptTrade = (GIFT_CFG.autoAcceptTrade == true),
+            autoAcceptGift  = (GIFT_CFG.autoAcceptGift  == true),
+
+            ----------------------------------------------------------------
+            -- LEGACY (BIAR FILE LAMA + UI LAMA MASIH KOMPATIBEL)
+            ----------------------------------------------------------------
+            targetUserId = GIFT_CFG.targetUserId,
+            targetName   = GIFT_CFG.targetName,
+        },
+    
+    
+
+
+
+        gift_mut = _cleanSet(GIFT_MUT_SELECTED or {}),
+        
+
+        
+        gbxpMaxEquip = tonumber(GBXP_MAX_EQUIP) or 0,  -- <<< DI SINI
+
+autokg_mutation_enabled = AUTOKG_MUTATION_ENABLED == true,
+ auto_boost_enabled   = AUTO_BOOST_ENABLED == true,
+        ----------------------------------------------------------------
+        -- â¬‡â¬‡â¬‡ TOGGLE AUTO GIFT / ACCEPT â¬‡â¬‡â¬‡
+        ----------------------------------------------------------------
+toggle = {
+    auto_gift   = AUTO_GIFT_ENABLED,
+    auto_accept = G.AUTO_ACCEPT_ENABLED,
+    auto_collect_fruit  = (AUTO_COLLECT_FRUIT_ENABLED == true),
+},
+
+
+        ----------------------------------------------------------------
+        -- â¬‡â¬‡â¬‡ MODE GBXP STAGE DISIMPAN DI SINI â¬‡â¬‡â¬‡
+        ----------------------------------------------------------------
+        stage_mode = GBXP_STAGE_MODE or "auto",
+
+        _meta   = {
+            place     = game.PlaceId,
+            user      = Players.LocalPlayer.UserId,
+            user_name = Players.LocalPlayer.Name,
+            ts        = os.time(),
+        },
+    }
+
+    local ok, json = pcall(HttpService.JSONEncode, HttpService, payload)
+    if ok and type(json)=="string" then
+        pcall(writefile, SAVE_FILE, json)
+    end
+end
+
+
+
+
+
+local function loadSelectionsFromFile()
+    if not CAN_FS or not isfile(SAVE_FILE) then return end
+
+    local ok, text = pcall(readfile, SAVE_FILE)
+    if not ok or not text or text == "" then return end
+
+    local ok2, data = pcall(HttpService.JSONDecode, HttpService, text)
+    if not ok2 or type(data) ~= "table" then return end
+
+    ----------------------------------------------------------------
+    -- 1) RESTORE SELECTED UUID PER TAB
+    ----------------------------------------------------------------
+    for k,_ in pairs(SAVE_TABS) do
+        if type(data[k]) == "table" then
+            selected[k] = {}
+            for uuid, v in pairs(data[k]) do
+                if v == true then
+                    selected[k][uuid] = true
+                end
+            end
+        end
+    end
+
+    ----------------------------------------------------------------
+    -- 2) RESTORE KONFIG UMUR
+    ----------------------------------------------------------------
+    if type(data.ages) == "table" then
+        if type(data.ages.equip) == "table" then
+            for tab, val in pairs(data.ages.equip) do
+                if TAB_AGE_EQUIP_MIN[tab] ~= nil and type(val) == "number" then
+                    TAB_AGE_EQUIP_MIN[tab] = val
+                end
+            end
+        end
+        if type(data.ages.unequip) == "table" then
+            for tab, val in pairs(data.ages.unequip) do
+                if TAB_AGE_UNEQUIP_MIN[tab] ~= nil and type(val) == "number" then
+                    TAB_AGE_UNEQUIP_MIN[tab] = val
+                end
+            end
+        end
+    end
+    
+    
+        if type(data.kg) == "table" then
+        if type(data.kg.equip) == "table" then
+            for tab, val in pairs(data.kg.equip) do
+                if TAB_W_EQUIP_MIN[tab] ~= nil and type(val) == "number" then
+                    TAB_W_EQUIP_MIN[tab] = val
+                end
+            end
+        end
+        if type(data.kg.unequip) == "table" then
+            for tab, val in pairs(data.kg.unequip) do
+                if TAB_W_UNEQUIP_MAX[tab] ~= nil and type(val) == "number" then
+                    TAB_W_UNEQUIP_MAX[tab] = val
+                end
+            end
+        end
+    end
+
+    ----------------------------------------------------------------
+    -- 3) RESTORE MUTASI GBXP (TAB GBXP)
+    ----------------------------------------------------------------
+    if type(data.gbxp_mut) == "table" then
+        GBXP_MUT_SELECTED = {}
+        for mutName, on in pairs(data.gbxp_mut) do
+            if on then
+                GBXP_MUT_SELECTED[tostring(mutName)] = true
+            end
+        end
+    end
+    
+----------------------------------------------------------------
+-- 3b) RESTORE SELECTED_PET_TYPES (dropdown "Select Pet To Boost")
+----------------------------------------------------------------
+if type(data.selected_pet_types) == "table" then
+    SELECTED_PET_TYPES = {}
+    for petName, on in pairs(data.selected_pet_types) do
+        if on then
+            SELECTED_PET_TYPES[tostring(petName)] = true
+        end
+    end
+end
+
+
+if type(data.petboost) == "table" then
+    PETBOOST_SELECTED = {}
+    for uuid, on in pairs(data.petboost) do
+        if on then
+            PETBOOST_SELECTED[tostring(uuid)] = true
+        end
+    end
+end
+
+if data.auto_boost_delay ~= nil then
+    AUTO_BOOST_DELAY = tonumber(data.auto_boost_delay) or 20
+    local G = (getgenv and getgenv()) or _G
+    G.AUTO_BOOST_DELAY = AUTO_BOOST_DELAY
+end   
+
+    if type(data.toggle.auto_collect_fruit) == "boolean" then
+        AUTO_COLLECT_FRUIT_ENABLED = data.toggle.auto_collect_fruit
+        G.AUTO_COLLECT_FRUIT_ENABLED = AUTO_COLLECT_FRUIT_ENABLED
+    end
+
+
+    ----------------------------------------------------------------
+    -- RESTORE AUTO BUY (NEW)
+    ----------------------------------------------------------------
+    if type(data.auto_buy) == "table" then
+        local ab = data.auto_buy
+
+        if type(ab.seed_enabled) == "boolean" then
+            AUTO_BUY_SEED_ENABLED = ab.seed_enabled
+        end
+        if type(ab.egg_enabled) == "boolean" then
+            AUTO_BUY_EGG_ENABLED = ab.egg_enabled
+        end
+        if type(ab.gear_enabled) == "boolean" then
+            AUTO_BUY_GEAR_ENABLED = ab.gear_enabled
+        end
+
+        if type(ab.seed_selected) == "table" then
+            SEED_SELECTED = {}
+            for k, on in pairs(ab.seed_selected) do
+                if on == true then
+                    SEED_SELECTED[tostring(k)] = true
+                end
+            end
+        end
+
+        if type(ab.egg_selected) == "table" then
+            EGG_SELECTED = {}
+            for k, on in pairs(ab.egg_selected) do
+                if on == true then
+                    EGG_SELECTED[tostring(k)] = true
+                end
+            end
+        end
+
+        if type(ab.gear_selected) == "table" then
+            GEAR_SELECTED = {}
+            for k, on in pairs(ab.gear_selected) do
+                if on == true then
+                    GEAR_SELECTED[tostring(k)] = true
+                end
+            end
+        end
+    end
+
+if type(data.auto_feed) == "table" then
+    local af = data.auto_feed
+
+    if type(af.enabled) == "boolean" then
+        AUTO_FEED_ENABLED = af.enabled
+    end
+
+    -- NEW: hunger_under (utama)
+    if af.hunger_under ~= nil then
+        AUTO_FEED_HUNGER_UNDER = tonumber(af.hunger_under) or AUTO_FEED_HUNGER_UNDER
+    -- BACKWARD COMPAT: kalau file lama masih pakai delay, mapping ke hunger_under default
+    elseif af.delay ~= nil and AUTO_FEED_HUNGER_UNDER == nil then
+        -- pilih salah satu:
+        -- (A) abaikan delay lama (recommended)
+        AUTO_FEED_HUNGER_UNDER = AUTO_FEED_HUNGER_UNDER or 60
+
+        -- (B) atau kalau kamu mau "delay" lama dipakai jadi hunger_under (tidak recommended)
+        -- AUTO_FEED_HUNGER_UNDER = tonumber(af.delay) or (AUTO_FEED_HUNGER_UNDER or 60)
+    end
+
+    if type(af.pets) == "table" then
+        AUTO_FEED_PETS_SELECTED = {}
+        for k, on in pairs(af.pets) do
+            if on then
+                AUTO_FEED_PETS_SELECTED[tostring(k)] = true
+            end
+        end
+    end
+
+    if type(af.fruits) == "table" then
+        AUTO_FEED_FRUITS_SELECTED = {}
+        for k, on in pairs(af.fruits) do
+            if on then
+                AUTO_FEED_FRUITS_SELECTED[tostring(k)] = true
+            end
+        end
+    end
+end
+
+
+    ----------------------------------------------------------------
+    -- 4) RESTORE KONFIG AUTO GIFT (âš™)
+    ----------------------------------------------------------------
+    if type(data.gift_cfg) == "table" then
+        local cfg = data.gift_cfg
+
+        ----------------------------------------------------------------
+        -- 4a) RESTORE TARGETS A / B / C
+        --     Bisa format baru (map bool) atau lama (struct {userId,name})
+        ----------------------------------------------------------------
+        local function restoreTargetsField(src, destKey)
+            if type(src) ~= "table" then return end
+
+            -- deteksi: apakah table-nya struct lama atau map bool baru
+            local isStruct = false
+            for _, v in pairs(src) do
+                if type(v) == "table" and (v.userId or v.name) then
+                    isStruct = true
+                    break
+                end
+            end
+
+            GIFT_CFG[destKey] = {}
+
+            if isStruct then
+                -- format lama: [k] = {userId=, name=}
+                for k, info in pairs(src) do
+                    if type(info) == "table" then
+                        local uid  = info.userId or tonumber(k)
+                        local name = info.name or ""
+                        if uid then
+                            GIFT_CFG[destKey][uid] = { userId = uid, name = name }
+                        end
+                    end
+                end
+            else
+                -- format baru: [key] = true/false
+                for k, on in pairs(src) do
+                    if on then
+                        GIFT_CFG[destKey][k] = true
+                    end
+                end
+            end
+        end
+
+        restoreTargetsField(cfg.targets,  "targets")
+        restoreTargetsField(cfg.targetsB, "targetsB")
+        restoreTargetsField(cfg.targetsC, "targetsC")
+
+        ----------------------------------------------------------------
+        -- 4b) RESTORE LIMIT KG / AGE
+        ----------------------------------------------------------------
+        if tonumber(cfg.minKG) then
+            GIFT_CFG.minKG = tonumber(cfg.minKG)
+        end
+        if tonumber(cfg.minAge) then
+            GIFT_CFG.minAge = tonumber(cfg.minAge)
+        end
+        if tonumber(cfg.minKGB) then
+            GIFT_CFG.minKGB = tonumber(cfg.minKGB)
+        end
+        if tonumber(cfg.minAgeB) then
+            GIFT_CFG.minAgeB = tonumber(cfg.minAgeB)
+        end
+        if tonumber(cfg.minKGC) then
+            GIFT_CFG.minKGC = tonumber(cfg.minKGC)
+        end
+        if tonumber(cfg.minAgeC) then
+            GIFT_CFG.minAgeC = tonumber(cfg.minAgeC)
+        end
+
+        ----------------------------------------------------------------
+        -- 4c) RESTORE ENABLE FLAG PER ROW
+        ----------------------------------------------------------------
+        if type(cfg.enabled) == "boolean" then
+            GIFT_CFG.enabled = cfg.enabled
+        end
+        if type(cfg.enabledB) == "boolean" then
+            GIFT_CFG.enabledB = cfg.enabledB
+        end
+        if type(cfg.enabledC) == "boolean" then
+            GIFT_CFG.enabledC = cfg.enabledC
+        end
+
+        ----------------------------------------------------------------
+        -- 4d) RESTORE PET TYPE FILTER
+        ----------------------------------------------------------------
+        local function restorePetTypeField(src, destKey)
+            if type(src) ~= "table" then return end
+            GIFT_CFG[destKey] = {}
+            for petName, on in pairs(src) do
+                if on then
+                    GIFT_CFG[destKey][tostring(petName)] = true
+                end
+            end
+        end
+
+        restorePetTypeField(cfg.petType,  "petType")
+        restorePetTypeField(cfg.petTypeB, "petTypeB")
+        restorePetTypeField(cfg.petTypeC, "petTypeC")
+        
+                ----------------------------------------------------------------
+        -- 4g) RESTORE MUTASI PER ROW (mut / mutB / mutC)
+        ----------------------------------------------------------------
+        local function restoreMutField(src, destKey)
+            if type(src) ~= "table" then return end
+            GIFT_CFG[destKey] = {}
+            for mutName, on in pairs(src) do
+                if on then
+                    GIFT_CFG[destKey][tostring(mutName)] = true
+                end
+            end
+        end
+
+        restoreMutField(cfg.mut,  "mut")
+        restoreMutField(cfg.mutB, "mutB")
+        restoreMutField(cfg.mutC, "mutC")
+
+
+        ----------------------------------------------------------------
+        -- 4e) RESTORE AUTO ACCEPT (NEW)
+        ----------------------------------------------------------------
+        if type(cfg.autoAcceptTrade) == "boolean" then
+            GIFT_CFG.autoAcceptTrade = cfg.autoAcceptTrade
+        end
+        if type(cfg.autoAcceptGift) == "boolean" then
+            GIFT_CFG.autoAcceptGift = cfg.autoAcceptGift
+        end
+
+        ----------------------------------------------------------------
+        -- 4f) LEGACY â†’ kalau file lama cuma punya targetUserId/targetName
+        --      MIGRASI ke GIFT_CFG.targets (group A)
+        ----------------------------------------------------------------
+        if (not GIFT_CFG.targets or next(GIFT_CFG.targets) == nil) then
+            local uid  = cfg.targetUserId
+            local name = cfg.targetName
+
+            if (type(uid) == "number" or type(uid) == "string") and type(name) == "string" then
+                local numId = tonumber(uid)
+                if numId then
+                    GIFT_CFG.targets = GIFT_CFG.targets or {}
+                    GIFT_CFG.targets[numId] = { userId = numId, name = name }
+                end
+            end
+        end
+
+        -- Simpan tetap legacy value kalau kamu masih butuh di tempat lain
+        if type(cfg.targetUserId) == "number" or type(cfg.targetUserId) == "string" then
+            GIFT_CFG.targetUserId = cfg.targetUserId
+        end
+        if type(cfg.targetName) == "string" then
+            GIFT_CFG.targetName = cfg.targetName
+        end
+    end
+
+
+
+    if type(data.gift_mut) == "table" then
+        GIFT_MUT_SELECTED = {}
+        for mutName, on in pairs(data.gift_mut) do
+            if on then
+                GIFT_MUT_SELECTED[tostring(mutName)] = true
+            end
+        end
+    end
+
+    if type(data.autokg_mutation_enabled) == "boolean" then
+        AUTOKG_MUTATION_ENABLED = data.autokg_mutation_enabled
+    end
+    if type(data.auto_boost_enabled) == "boolean" then
+    AUTO_BOOST_ENABLED = data.auto_boost_enabled
+   
+    end
+    
+    
+    
+    ----------------------------------------------------------------
+    -- 5) RESTORE TOGGLE STATE (AUTO GIFT + AUTO ACCEPT)
+    ----------------------------------------------------------------
+if type(data.toggle) == "table" then
+    if type(data.toggle.auto_gift) == "boolean" then
+        AUTO_GIFT_ENABLED = data.toggle.auto_gift
+        
+    end
+    if type(data.toggle.auto_accept) == "boolean" then
+        G.AUTO_ACCEPT_ENABLED = data.toggle.auto_accept
+        AUTO_ACCEPT_ENABLED   = G.AUTO_ACCEPT_ENABLED
+    end
+
+
+end
+    ----------------------------------------------------------------
+    -- 5b) RESTORE REJOIN SETTINGS (NEW)
+    ----------------------------------------------------------------
+if type(data.rejoin) == "table" then
+    if type(data.rejoin.auto_reconnect) == "boolean" then
+        AUTO_RECONNECT_ENABLED = data.rejoin.auto_reconnect
+    end
+    if type(data.rejoin.auto_exec) == "boolean" then
+        AUTO_START_ON_REJOIN = data.rejoin.auto_exec
+    end
+    if type(data.rejoin.auto_start_kg) == "boolean" then
+        AUTO_START_KG_ON_REJOIN = data.rejoin.auto_start_kg
+    end
+end
+
+    ----------------------------------------------------------------
+    -- RESTORE AUTO OPEN ROBLOX (TERMUX)
+    ----------------------------------------------------------------
+    if type(data.auto_open_rblx) == "table" then
+        local ao = data.auto_open_rblx
+
+        if type(ao.enabled) == "boolean" then
+            AUTO_OPEN_RBLX_ENABLED = ao.enabled
+        end
+
+        if type(ao.mode) == "string" then
+            AUTO_OPEN_RBLX_MODE = ao.mode
+        end
+
+        if type(ao.link) == "string" then
+            AUTO_OPEN_RBLX_LINK = ao.link
+        end
+
+        if ao.open_min ~= nil then
+            local n = tonumber(ao.open_min)
+            if n and n >= 0 then
+                AUTO_OPEN_RBLX_OPEN_MIN = n
+            end
+        end
+
+        if ao.close_min ~= nil then
+            local n = tonumber(ao.close_min)
+            if n and n >= 0 then
+                AUTO_OPEN_RBLX_CLOSE_MIN = n
+            end
+        end
+    end
+
+
+pcall(function()
+    if _G.PSReconnect and type(_G.PSReconnect.SetEnabled) == "function" then
+        _G.PSReconnect:SetEnabled(AUTO_RECONNECT_ENABLED == true)
+    end
+end)
+
+----------------------------------------------------------------
+-- RESTORE SWAP SKILL
+----------------------------------------------------------------
+if type(data.swap_skill) == "table" then
+    local ss = data.swap_skill
+
+    swap_skill = swap_skill or {}
+    G.swap_skill = swap_skill
+
+    if type(ss.enabled) == "boolean" then
+        swap_skill.enabled = ss.enabled
+    end
+
+    if type(ss.selected) == "table" then
+        swap_skill.selected = {}
+        for k, on in pairs(ss.selected) do
+            if on == true then
+                swap_skill.selected[tostring(k)] = true
+            end
+        end
+    end
+
+    if type(ss.order) == "table" then
+        swap_skill.order = {}
+        for i, v in ipairs(ss.order) do
+            if v ~= nil then
+                swap_skill.order[#swap_skill.order+1] = tostring(v)
+            end
+        end
+    end
+
+    if type(ss.delays) == "table" then
+        swap_skill.delays = {}
+        for uuid, d in pairs(ss.delays) do
+            if type(d) == "table" then
+                local a = tonumber(d.unequipAfterReady)
+                local b = tonumber(d.equipNext)
+                swap_skill.delays[tostring(uuid)] = {
+                    unequipAfterReady = a,
+                    equipNext         = b,
+                }
+            end
+        end
+    end
+
+    if ss.poll ~= nil then
+        swap_skill.poll = tonumber(ss.poll) or swap_skill.poll
+    end
+    if ss.scanInterval ~= nil then
+        swap_skill.scanInterval = tonumber(ss.scanInterval) or swap_skill.scanInterval
+    end
+
+    -- sync ke module kalau sudah ter-load
+    pcall(function()
+        local Mod = rawget(_G, "SwapSkillModule") or rawget(_G, "SwapSkill") or rawget(_G, "swap_skill_module")
+        if Mod then
+            if type(Mod.SyncFromState) == "function" then
+                Mod:SyncFromState()
+            elseif type(Mod.syncFromState) == "function" then
+                Mod:syncFromState()
+            end
+
+            -- optional: auto start/stop sesuai enabled
+            if swap_skill.enabled == true then
+                if type(Mod.Start) == "function" then Mod:Start()
+                elseif type(Mod.start) == "function" then Mod:start() end
+            else
+                if type(Mod.Stop) == "function" then Mod:Stop("state_load")
+                elseif type(Mod.stop) == "function" then Mod:stop("state_load") end
+            end
+        end
+    end)
+end
+
+    ----------------------------------------------------------------
+    -- 6) RESTORE GBXP_STAGE_MODE
+    ----------------------------------------------------------------
+    if type(data.stage_mode) == "string" then
+        if setGBXPStageMode then
+            -- pakai helper supaya CURRENT_STAGE, dll ikut di-reset
+            setGBXPStageMode(data.stage_mode)
+        else
+            -- fallback kalau fungsi belum ada
+            GBXP_STAGE_MODE = data.stage_mode
+        end
+    end
+    
+     if data.gbxpMaxEquip ~= nil then
+        GBXP_MAX_EQUIP = tonumber(data.gbxpMaxEquip) or 0
+    end
+
+    ----------------------------------------------------------------
+    -- 7) REFRESH UI (kalau sudah ada elemen UI-nya)
+    ----------------------------------------------------------------
+    -- label jumlah pilih per tab
+    if refreshSelectedHeaderLabels then
+        refreshSelectedHeaderLabels()
+    end
+
+    -- panel umur kanan
+    if ui and ui.refreshAgeConfigUI then
+        ui.refreshAgeConfigUI()
+    end
+
+    -- list mutasi GBXP
+    if ui and ui.rebuildGBXPMutationList then
+        ui.rebuildGBXPMutationList()
+    end
+    
+        -- dropdown pet type untuk boost
+    if ui and ui.rebuildPetTypeList then
+        ui.rebuildPetTypeList()
+    end
+
+
+    -- list mutasi Auto Gift (âš™)
+    if ui and ui.rebuildGiftMutList then
+        ui.rebuildGiftMutList()
+        updateGiftModeDescription()
+    end
+
+    -- isi textbox / tombol Auto Gift
+        if ui then
+        ----------------------------------------------------------------
+        -- Target A & B button text
+        ----------------------------------------------------------------
+        if refreshTargetLabel then
+            refreshTargetLabel()
+        elseif ui.giftTargetBtn then
+            -- fallback kalau refreshTargetLabel belum ada
+            if GIFT_CFG.targetName and GIFT_CFG.targetName ~= "" then
+                ui.giftTargetBtn.Text = "  " .. GIFT_CFG.targetName
+            else
+                ui.giftTargetBtn.Text = "  Target A: pilih player..."
+            end
+        end
+
+        ----------------------------------------------------------------
+        -- TextBox KG/AGE A & B
+        ----------------------------------------------------------------
+        if ui.giftKgBox then
+            if GIFT_CFG.minKG and GIFT_CFG.minKG ~= 0 then
+                ui.giftKgBox.Text = tostring(GIFT_CFG.minKG)
+            else
+                ui.giftKgBox.Text = ""
+            end
+        end
+
+        if ui.giftAgeBox then
+            if GIFT_CFG.minAge and GIFT_CFG.minAge ~= 0 then
+                ui.giftAgeBox.Text = tostring(GIFT_CFG.minAge)
+            else
+                ui.giftAgeBox.Text = ""
+            end
+        end
+
+        if ui.giftKgBoxB then
+            if GIFT_CFG.minKGB and GIFT_CFG.minKGB ~= 0 then
+                ui.giftKgBoxB.Text = tostring(GIFT_CFG.minKGB)
+            else
+                ui.giftKgBoxB.Text = ""
+            end
+        end
+
+        if ui.giftAgeBoxB then
+            if GIFT_CFG.minAgeB and GIFT_CFG.minAgeB ~= 0 then
+                ui.giftAgeBoxB.Text = tostring(GIFT_CFG.minAgeB)
+            else
+                ui.giftAgeBoxB.Text = ""
+            end
+        end
+    end
+
+
+    if ui then
+        if ui.updateGiftToggleUI then
+            ui.updateGiftToggleUI()
+        end
+        if ui.updateAcceptToggleUI then
+            ui.updateAcceptToggleUI()
+        end
+    end
+
+    -- sinkronkan teks & warna tombol MODE ke stage_mode yang baru di-load
+    if _updateModeText then
+        _updateModeText()
+    end
+    if refreshModeBtn then
+        refreshModeBtn()
+    end
+    
+ pcall(function()
+    if _G.AutoKGBoost and _G.AutoKGBoost.syncFromState then
+        _G.AutoKGBoost:syncFromState()
+    end
+end)   
+
+    ----------------------------------------------------------------
+    -- 8) PUSH MUTASI GBXP ke WorldShardCleaner (kalau ada)
+    ----------------------------------------------------------------
+pcall(function()
+    if _G.WorldShardCleaner then
+        if _G.WorldShardCleaner.setGoodMutationsFromGBXP then
+            _G.WorldShardCleaner:setGoodMutationsFromGBXP(GBXP_MUT_SELECTED)
+        end
+
+        if _G.WorldShardCleaner.setEnabled then
+            _G.WorldShardCleaner:setEnabled(AUTOKG_MUTATION_ENABLED)
+        end
+    end
+end)
+
+    -- sync agar module auto buy langsung kebaca
+    pcall(function()
+        if STATE then
+            STATE.autoBuySeeds = (AUTO_BUY_SEED_ENABLED == true)
+            STATE.autoBuyEgg   = (AUTO_BUY_EGG_ENABLED  == true)
+            STATE.autoBuyGear  = (AUTO_BUY_GEAR_ENABLED == true)
+        end
+        if SHOP_INFO then
+            if SHOP_INFO.seed then SHOP_INFO.seed.selected = SEED_SELECTED or {} end
+            if SHOP_INFO.egg  then SHOP_INFO.egg.selected  = EGG_SELECTED  or {} end
+            if SHOP_INFO.gear then SHOP_INFO.gear.selected = GEAR_SELECTED or {} end
+        end
+    end)
+    
+pcall(function()
+    local Feed = rawget(_G, "AutoFeed") or rawget(_G, "AutoKGFeed")
+    if Feed and type(Feed.syncFromState) == "function" then
+        Feed:syncFromState()
+    end
+end)
+
+pcall(function()
+    local M = rawget(_G, "AutoCollectFruit") or rawget(G, "AutoCollectFruit")
+    if M then
+        if type(M.SetEnabled) == "function" then
+            M.SetEnabled(AUTO_COLLECT_FRUIT_ENABLED == true)
+        elseif type(M.setEnabled) == "function" then
+            M.setEnabled(AUTO_COLLECT_FRUIT_ENABLED == true)
+        elseif (AUTO_COLLECT_FRUIT_ENABLED == true) and type(M.start) == "function" then
+            M.start()
+        elseif (AUTO_COLLECT_FRUIT_ENABLED ~= true) and type(M.stop) == "function" then
+            M.stop("state_load")
+        end
+    end
+end)
+
+
+end
+
+-- ===== deps untuk pruneSelectedFromStore (SAMAKAN dengan PetListView) =====
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LocalPlayer = Players.LocalPlayer
+
+local ActivePetsService = nil
+pcall(function()
+    ActivePetsService = require(ReplicatedStorage.Modules.PetServices.ActivePetsService)
+end)
+
+local function __normUUID(u)
+    if not u or u == "" then return nil, nil end
+    local core = tostring(u):match("{?([0-9a-fA-F%-]+)}?") or tostring(u)
+    return core, "{" .. core .. "}"
+end
+
+local function __getStoreBag()
+    if not ActivePetsService or type(ActivePetsService.GetPlayerDatastorePetData) ~= "function" then
+        return nil
+    end
+    local ok, store = pcall(function()
+        return ActivePetsService:GetPlayerDatastorePetData(LocalPlayer.Name)
+    end)
+    if not ok or type(store) ~= "table" then
+        return nil
+    end
+    local inv = store.PetInventory
+    local data = inv and inv.Data
+    if type(data) ~= "table" then
+        return nil
+    end
+    return data
+end
+
+
+
+local function pruneSelectedFromStore()
+    local bag = __getStoreBag()
+    if not bag then return false end
+
+    local exists = {}
+    for rawUUID,_ in pairs(bag) do
+        local core, br = __normUUID(rawUUID)
+        if core then exists[core] = true end
+        if br then exists[br] = true end
+    end
+
+    local function pruneSet(setTbl)
+        if type(setTbl) ~= "table" then return 0 end
+        local removed = 0
+        for u,_ in pairs(setTbl) do
+            local core, br = __normUUID(u)
+            if not ((core and exists[core]) or (br and exists[br])) then
+                setTbl[u] = nil
+                removed += 1
+            end
+        end
+        return removed
+    end
+
+    local totalRemoved = 0
+    totalRemoved += pruneSet(selected.boost)
+    totalRemoved += pruneSet(selected.noos)
+    totalRemoved += pruneSet(selected.seratusage)
+    totalRemoved += pruneSet(selected.xp)
+    totalRemoved += pruneSet(selected.gbxp)
+
+    if totalRemoved > 0 then
+        -- kasih sinyal ke tabs_autokg.lua supaya refresh list+summary walau tab gak dibuka
+        _G.__AUTOKG_DIRTY = true
+
+        -- simpan biar file bersih
+        pcall(saveSelectionsToFile)
+        return true
+    end
+
+    return false
+end
+
+
+
+--------------------------------------------------
+-- 3) EXPORT MODULE
+--------------------------------------------------
+local State = {}
+
+function State.save()
+    saveSelectionsToFile()
+end
+
+function State.load()
+    loadSelectionsFromFile()
+end
+
+task.spawn(function()
+    while true do
+        pcall(pruneSelectedFromStore)
+        task.wait(5)
+    end
+end)
+
+
+
+
+function autoSave()
+    State.save()
+end
+
+
+
+return State
+

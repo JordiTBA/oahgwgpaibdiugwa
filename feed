@@ -1,0 +1,531 @@
+-- feed.lua (NodeHub FAST)
+-- Auto Feed pet aktif bila Hunger < AUTO_FEED_HUNGER_UNDER
+-- Data:
+--   profile = DataService:GetData()
+--   pets    = profile.PetsData.PetInventory.Data
+--   inv     = profile.InventoryData
+-- Fruit:
+--   ItemType == "Holdable" + ItemData.ItemName match selected fruits
+-- Action:
+--   Equip holdable tool (uuid inventory via attr c/C) -> ActivePetService:FireServer("Feed", petUUID)
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local LP = Players.LocalPlayer
+
+local ActivePetsService = require(ReplicatedStorage.Modules.PetServices.ActivePetsService)
+local DataService       = require(ReplicatedStorage.Modules.DataService)
+
+local ge = ReplicatedStorage:FindFirstChild("GameEvents")
+        or ReplicatedStorage:FindFirstChild("gameEvents")
+
+----------------------------------------------------------------
+-- CONFIG / DEBUG
+----------------------------------------------------------------
+local DEBUG = false
+
+-- Speed knobs
+local LOOP_TICK_SEC        = 0.25     -- lebih responsif
+local EQUIP_WAIT           = 0.11     -- lebih cepat dari 0.35
+local FIRE_WAIT            = 0.06
+local GLOBAL_GAP_SEC       = 0.08     -- jeda antar feed action
+local PER_PET_COOLDOWN_SEC = 0.25     -- jangan spam 1 pet
+local CACHE_REFRESH_SEC    = 0.75     -- refresh cache holdable dari InventoryData
+
+-- throttle warn supaya tidak spam
+local LAST_WARN_AT = 0
+local function warnThrottle(msg)
+    if DEBUG then
+    local now = os.clock()
+    if (now - LAST_WARN_AT) >= 2.0 then
+        LAST_WARN_AT = now
+        warn(msg)
+    end
+    end
+end
+
+local function dprint(...)
+    if DEBUG then print("[AutoFeed]", ...) end
+end
+
+local function dwarn(...)
+    if DEBUG then warn("[AutoFeed]", ...) end
+end
+
+----------------------------------------------------------------
+-- RUNTIME
+----------------------------------------------------------------
+local RUNNING    = false
+local THREAD     = nil
+local STOP_TOKEN = 0
+
+local LAST_FEED_AT = {} -- [uuidCore] = os.clock()
+
+----------------------------------------------------------------
+-- UUID helpers (gaya boost)
+----------------------------------------------------------------
+local function normalizeUUID(u)
+    if not u then return nil, nil end
+    local core = tostring(u):match("{?([0-9a-fA-F%-]+)}?") or tostring(u)
+    return core, "{" .. core .. "}"
+end
+
+----------------------------------------------------------------
+-- Backpack tool cache (FAST O(1))
+----------------------------------------------------------------
+local BACKPACK = LP:WaitForChild("Backpack")
+local TOOL_BY_ITEMCORE = {} -- [itemCore] = Tool
+
+local function rebuildToolCache()
+    TOOL_BY_ITEMCORE = {}
+    for _, tool in ipairs(BACKPACK:GetChildren()) do
+        if tool:IsA("Tool") then
+            local attr = tool:GetAttribute("c") or tool:GetAttribute("C")
+            if attr then
+                local core = select(1, normalizeUUID(attr))
+                if core then
+                    TOOL_BY_ITEMCORE[core] = tool
+                end
+            end
+        end
+    end
+end
+
+rebuildToolCache()
+BACKPACK.ChildAdded:Connect(function() task.defer(rebuildToolCache) end)
+BACKPACK.ChildRemoved:Connect(function() task.defer(rebuildToolCache) end)
+
+----------------------------------------------------------------
+-- Unequip all tools
+----------------------------------------------------------------
+local function unequipAllTools()
+    local char = LP.Character
+    if not char then return end
+    for _, inst in ipairs(char:GetChildren()) do
+        if inst:IsA("Tool") then
+            inst.Parent = BACKPACK
+        end
+    end
+end
+
+----------------------------------------------------------------
+-- Find Tool by Inventory UUID (attr c/C) using cache
+----------------------------------------------------------------
+local function findToolByItemUUID(itemUUID)
+    local itemCore = select(1, normalizeUUID(itemUUID))
+    if not itemCore then return nil end
+    return TOOL_BY_ITEMCORE[itemCore]
+end
+
+local function equipTool(tool)
+    local char = LP.Character
+    if not char or not tool then return false end
+
+    -- unequip hanya jika ada tool lain yang berbeda
+    for _, inst in ipairs(char:GetChildren()) do
+        if inst:IsA("Tool") and inst ~= tool then
+            unequipAllTools()
+            break
+        end
+    end
+
+    tool.Parent = char
+    task.wait(EQUIP_WAIT)
+    return true
+end
+
+----------------------------------------------------------------
+-- Get PROFILE (sesuai kode dump kamu)
+----------------------------------------------------------------
+local function getProfile()
+    local ok, profile = pcall(function()
+        if type(DataService.GetData) == "function" then
+            return DataService:GetData()
+        end
+        return nil
+    end)
+    if ok and type(profile) == "table" and next(profile) ~= nil then
+        return profile
+    end
+    return nil
+end
+
+----------------------------------------------------------------
+-- Resolve ActivePetService RemoteEvent (GameEvents)
+----------------------------------------------------------------
+local function resolveActivePetRE()
+    if not ge then return nil end
+    return ge:FindFirstChild("ActivePetService") or ge:FindFirstChild("ActivePetsService")
+end
+
+----------------------------------------------------------------
+-- PetType filter (AUTO_FEED_PETS_SELECTED adalah pettype list)
+-- Jika kosong -> ALL active pets
+----------------------------------------------------------------
+local function buildSelectedPetTypeMap()
+    local map = _G.AUTO_FEED_PETS_SELECTED or AUTO_FEED_PETS_SELECTED or {}
+    if type(map) ~= "table" then return nil end
+
+    local out = {}
+    local hasAny = false
+    for petType, enabled in pairs(map) do
+        if enabled then
+            out[tostring(petType):lower()] = true
+            hasAny = true
+        end
+    end
+
+    if not hasAny then
+        return nil -- ALL
+    end
+
+    return out
+end
+
+----------------------------------------------------------------
+-- Active pets from ClientPetState (mirip boost) + pettype filter
+----------------------------------------------------------------
+local function getActivePetsFiltered()
+    local out = {}
+
+    local cps = ActivePetsService.ClientPetState
+    if type(cps) ~= "table" then return out end
+
+    local perPlayer = cps[LP] or cps[LP.UserId] or cps[LP.Name]
+    if type(perPlayer) ~= "table" then return out end
+
+    local selectedMap = buildSelectedPetTypeMap()
+
+    for uuidKey, handlers in pairs(perPlayer) do
+        if type(handlers) == "table" then
+            local rec = handlers.PetModelHandler
+                or handlers.PetVFXHandler
+                or handlers.PetSoundHandler
+
+            if type(rec) == "table" then
+                local pd = rec.PetData or rec.Data or {}
+                local pt = pd.PetType or rec.PetType or rec.Name or ""
+                local petTypeName  = tostring(pt)
+                local petTypeLower = petTypeName:lower()
+
+                local allowed = (selectedMap == nil) or (selectedMap[petTypeLower] == true)
+                if allowed then
+                    local core, braced = normalizeUUID(rec.UUID or uuidKey)
+                    if core and braced then
+                        out[#out+1] = {
+                            uuidCore   = core,
+                            uuidBraced = braced,
+                            petType    = petTypeName,
+                        }
+                    end
+                end
+            end
+        end
+    end
+
+    return out
+end
+
+----------------------------------------------------------------
+-- Hunger from PetsData (PROFILE)
+----------------------------------------------------------------
+local function getPetHunger(profile, petUUIDBraced)
+    local petsData = profile and profile.PetsData
+    if type(petsData) ~= "table" then return nil end
+
+    local inv = petsData.PetInventory
+    if type(inv) ~= "table" then return nil end
+
+    local data = inv.Data
+    if type(data) ~= "table" then return nil end
+
+    local core, braced = normalizeUUID(petUUIDBraced)
+    if not core then return nil end
+
+    local rec = data[braced] or data[core]
+    if type(rec) ~= "table" then return nil end
+
+    local pd = rec.PetData
+    if type(pd) ~= "table" then return nil end
+
+    local h = pd.Hunger
+    if type(h) == "number" then return h end
+    return nil
+end
+
+----------------------------------------------------------------
+-- Hunger under threshold (angka besar)
+----------------------------------------------------------------
+local function getHungerUnder()
+    local v = tonumber(_G.AUTO_FEED_HUNGER_UNDER or AUTO_FEED_HUNGER_UNDER)
+    if not v or v <= 0 then
+        v = 10000 -- fallback aman
+    end
+    return v
+end
+
+----------------------------------------------------------------
+-- Selected Holdable cache (FAST)
+----------------------------------------------------------------
+local CACHED_ITEM_UUIDS = {}
+local CACHED_WANT_KEY   = ""
+local CACHED_AT         = 0
+
+local function computeWantKey()
+    local selected = _G.AUTO_FEED_FRUITS_SELECTED or AUTO_FEED_FRUITS_SELECTED
+    if type(selected) ~= "table" then return "" end
+    local keys = {}
+    for k, on in pairs(selected) do
+        if on then
+            keys[#keys+1] = tostring(k):lower()
+        end
+    end
+    table.sort(keys)
+    return table.concat(keys, "|")
+end
+
+local function rebuildHoldableCache(profile)
+    local out = {}
+
+    local selected = _G.AUTO_FEED_FRUITS_SELECTED or AUTO_FEED_FRUITS_SELECTED
+    if type(selected) ~= "table" then
+        selected = {}
+    end
+
+    -- build want map + detect apakah user memilih minimal 1 buah
+    local want = {}
+    local hasAnySelected = false
+    for name, on in pairs(selected) do
+        if on then
+            want[tostring(name):lower()] = true
+            hasAnySelected = true
+        end
+    end
+
+    local inv = profile and profile.InventoryData
+    if type(inv) ~= "table" then
+        CACHED_ITEM_UUIDS = out
+        return
+    end
+
+    for itemUUID, itemRec in pairs(inv) do
+        if type(itemRec) == "table" and itemRec.ItemType == "Holdable" then
+            local id = itemRec.ItemData
+            if type(id) == "table" then
+                local nm = tostring(id.ItemName or ""):lower()
+
+                -- âœ… Filter Favorite: skip kalau IsFavorite true
+                if id.IsFavorite ~= true then
+                    -- âœ… Kalau user tidak select apa pun -> ALL holdable masuk
+                    -- âœ… Kalau user select -> hanya yang cocok di want[]
+                    if (not hasAnySelected) or (nm ~= "" and want[nm]) then
+                        out[#out+1] = tostring(itemUUID)
+                    end
+                end
+            else
+                -- kalau ItemData bukan table, tetap bisa masuk kalau mode ALL (no selection)
+                if (not hasAnySelected) then
+                    out[#out+1] = tostring(itemUUID)
+                end
+            end
+        end
+    end
+
+    CACHED_ITEM_UUIDS = out
+end
+
+
+local function getSelectedHoldableItemUUIDsFast(profile)
+    local now = os.clock()
+    local key = computeWantKey()
+
+    if key ~= CACHED_WANT_KEY or (now - CACHED_AT) >= CACHE_REFRESH_SEC then
+        CACHED_WANT_KEY = key
+        CACHED_AT = now
+        rebuildHoldableCache(profile)
+    end
+
+    return CACHED_ITEM_UUIDS
+end
+
+----------------------------------------------------------------
+-- FEED ONE
+----------------------------------------------------------------
+local function feedOne(activePetRE, petUUIDBraced, itemUUID)
+    local tool = findToolByItemUUID(itemUUID)
+    if not tool then
+        return false
+    end
+
+    if not equipTool(tool) then
+        return false
+    end
+
+    task.wait(FIRE_WAIT)
+
+    local ok = pcall(function()
+        activePetRE:FireServer("Feed", petUUIDBraced)
+    end)
+
+    task.wait(FIRE_WAIT)
+    -- unequip cepat biar tool balik (optional tapi aman)
+    unequipAllTools()
+
+    return ok == true
+end
+
+----------------------------------------------------------------
+-- WORKER
+----------------------------------------------------------------
+local function worker(myToken)
+    local activePetRE = resolveActivePetRE()
+    if not activePetRE then
+        dwarn("Remote ActivePetService tidak ditemukan di GameEvents")
+        return
+    end
+
+    dprint("Worker start. Remote =", activePetRE.Name)
+
+    while RUNNING and (myToken == STOP_TOKEN) do
+        local profile = getProfile()
+        if not profile then
+            warnThrottle("[AutoFeed] PROFILE kosong / belum loaded (DataService:GetData())")
+            task.wait(1)
+        else
+            local pets  = getActivePetsFiltered()
+            local items = getSelectedHoldableItemUUIDsFast(profile)
+            local under = getHungerUnder()
+
+            if type(profile.InventoryData) ~= "table" then
+                warnThrottle("[AutoFeed] profile.InventoryData tidak ada / bukan table")
+            end
+
+            if #items == 0 then
+                warnThrottle("[AutoFeed] Holdable selected tidak ada / tidak ditemukan di InventoryData.")
+            end
+
+            if #pets > 0 and #items > 0 then
+                for _, p in ipairs(pets) do
+                    if not RUNNING or (myToken ~= STOP_TOKEN) then break end
+
+                    local last = LAST_FEED_AT[p.uuidCore]
+                    if last and (os.clock() - last) < PER_PET_COOLDOWN_SEC then
+                        -- cooldown pet
+                    else
+                        local h = getPetHunger(profile, p.uuidBraced)
+                        if type(h) == "number" then
+                            if DEBUG then
+                                dprint(("Pet %s Hunger=%s Under=%s"):format(p.petType, tostring(h), tostring(under)))
+                            end
+
+                            if h < under then
+                                local fed = false
+                                -- coba beberapa item (tool harus ada)
+                                for i = 1, #items do
+                                    if not RUNNING or (myToken ~= STOP_TOKEN) then break end
+                                    local itemUUID = items[i]
+                                    local ok = feedOne(activePetRE, p.uuidBraced, itemUUID)
+                                    if ok then
+                                        LAST_FEED_AT[p.uuidCore] = os.clock()
+                                        fed = true
+                                        if DEBUG then
+                                            dprint("Feed OK:", p.petType, p.uuidBraced, "itemUUID:", itemUUID)
+                                        end
+                                        task.wait(GLOBAL_GAP_SEC)
+                                        break
+                                    end
+                                end
+
+                                if (not fed) and DEBUG then
+                                    dprint("Skip feed (tool holdable tidak ada di backpack?)")
+                                end
+                            end
+                        elseif DEBUG then
+                            dprint("Hunger tidak ketemu:", p.petType, p.uuidBraced)
+                        end
+                    end
+                end
+            end
+
+            task.wait(LOOP_TICK_SEC)
+        end
+    end
+
+    dprint("Worker stop.")
+end
+
+----------------------------------------------------------------
+-- PUBLIC API
+----------------------------------------------------------------
+local M = {}
+
+function M.isRunning()
+    return RUNNING
+end
+
+function M.setDebug(on)
+    DEBUG = (on == true)
+end
+
+function M.setHungerUnder(v)
+    local n = tonumber(v)
+    if not n then return end
+    AUTO_FEED_HUNGER_UNDER = n
+    _G.AUTO_FEED_HUNGER_UNDER = n
+end
+
+function M.setPets(map)
+    AUTO_FEED_PETS_SELECTED = map or {}
+    _G.AUTO_FEED_PETS_SELECTED = AUTO_FEED_PETS_SELECTED
+end
+
+function M.setFruits(map)
+    AUTO_FEED_FRUITS_SELECTED = map or {}
+    _G.AUTO_FEED_FRUITS_SELECTED = AUTO_FEED_FRUITS_SELECTED
+    -- invalidate cache segera
+    CACHED_WANT_KEY = ""
+end
+
+function M.stop()
+    RUNNING = false
+    STOP_TOKEN += 1
+    THREAD = nil
+    pcall(unequipAllTools)
+    dprint("Stop() token=", STOP_TOKEN)
+end
+
+function M.start()
+    if RUNNING then
+        dprint("Start() ignored: already running")
+        return
+    end
+
+    RUNNING = true
+    local myToken = STOP_TOKEN
+    dprint("Start() token=", myToken)
+
+    THREAD = task.spawn(function()
+        pcall(worker, myToken)
+    end)
+end
+
+function M.syncFromState()
+    _G.AUTO_FEED_ENABLED      = (AUTO_FEED_ENABLED == true)
+    _G.AUTO_FEED_HUNGER_UNDER = tonumber(_G.AUTO_FEED_HUNGER_UNDER or AUTO_FEED_HUNGER_UNDER)
+    _G.AUTO_FEED_PETS_SELECTED   = _G.AUTO_FEED_PETS_SELECTED or AUTO_FEED_PETS_SELECTED or {}
+    _G.AUTO_FEED_FRUITS_SELECTED = _G.AUTO_FEED_FRUITS_SELECTED or AUTO_FEED_FRUITS_SELECTED or {}
+
+    -- invalidate cache kalau perlu
+    CACHED_WANT_KEY = ""
+
+    if _G.AUTO_FEED_ENABLED then
+        M.start()
+    else
+        M.stop()
+    end
+end
+
+_G.AutoFeed   = M
+_G.AutoKGFeed = M
+return M
