@@ -1119,7 +1119,7 @@ EmbeddedModules["special/webhook.lua"] = function()
     local Core
     local Discord
 
-    local WEBHOOK_USERNAME = "Pandorá Hub"
+    local WEBHOOK_USERNAME = "jordi_galer  Hub"
     local WEBHOOK_AVATAR = "https://i.ibb.co.com/5X81cGVH/pandorahub-removebg-preview.png"
 
     local PlayerName
@@ -6609,7 +6609,7 @@ EmbeddedModules["pet/webhook.lua"] = function()
     local Core
     local Discord
 
-    local WEBHOOK_USERNAME = "Pandorá Hub"
+    local WEBHOOK_USERNAME = "jordi_galer  Hub"
     local WEBHOOK_AVATAR = "https://i.ibb.co.com/5X81cGVH/pandorahub-removebg-preview.png"
     local HEAVY_HATCH_WEBHOOK_URL = "https://discord.com/api/webhooks/1451326910184292436/QEqdOJhUcjLj6G7cJKQ4OHWoghMFUSaFCpD65N9e8ErYi9yLRfHryzpn7gEtv2-WdrLa"
     local HEAVY_HATCH_WEIGHT_THRESHOLD = 6
@@ -6907,7 +6907,7 @@ EmbeddedModules["pet/webhook.lua"] = function()
             avatar_url = WEBHOOK_AVATAR,
             content = "",
             embeds = {{
-                title = "**Pandorá Hub — Hatch Summary**",
+                title = "**jordi_galer  Hub — Hatch Summary**",
                 type = 'rich',
                 color = tonumber("0x8B0000"), -- Blood Moon color (dark crimson red)
                 fields = {{
@@ -6971,7 +6971,7 @@ EmbeddedModules["pet/webhook.lua"] = function()
             avatar_url = WEBHOOK_AVATAR,       
             content = pingContent, 
             embeds = {{
-                title = "**Pandorá Hub**",
+                title = "**jordi_galer  Hub**",
                 type = 'rich',
                 color = tonumber("0x8B00FF"),
                 fields = {{
@@ -7014,7 +7014,7 @@ EmbeddedModules["pet/webhook.lua"] = function()
             avatar_url = WEBHOOK_AVATAR,       
             content = pingContent, 
             embeds = {{
-                title = "**Pandorá Hub**",
+                title = "**jordi_galer  Hub**",
                 type = 'rich',
                 color = tonumber("0x00FF00"),
                 fields = {{
@@ -7057,7 +7057,7 @@ EmbeddedModules["pet/webhook.lua"] = function()
             avatar_url = WEBHOOK_AVATAR,       
             content = pingContent, 
             embeds = {{
-                title = "**Pandorá Hub**",
+                title = "**jordi_galer  Hub**",
                 type = 'rich',
                 color = tonumber("0x0000FF"),
                 fields = {{
@@ -19040,7 +19040,7 @@ EmbeddedModules["notification/webhook.lua"] = function()
     local Core
     local Discord
 
-    local WEBHOOK_USERNAME = "Pandorá Hub"
+    local WEBHOOK_USERNAME = "jordi_galer  Hub"
     local WEBHOOK_AVATAR = "https://i.ibb.co.com/5X81cGVH/pandorahub-removebg-preview.png"
 
     local PlayerName
@@ -26760,8 +26760,8 @@ if game:GetService("Players").LocalPlayer:GetAttribute("IsPandoraHubRunning") th
     game.StarterGui:SetCore(
         "SendNotification",
         {
-            Title = "Pandorá Hub",
-            Text = "Pandorá Hub is already running!",
+            Title = "jordi_galer  Hub",
+            Text = "jordi_galer  Hub is already running!",
             Duration = 5
         }
     )
@@ -26851,7 +26851,7 @@ task.spawn(function()
         game.StarterGui:SetCore(
             "SendNotification",
             {
-                Title = "Pandorá Hub",
+                Title = "jordi_galer  Hub",
                 Text = "Waiting for player data to be fully loaded...",
                 Duration = 3
             }
@@ -26868,7 +26868,7 @@ notificationActive = false -- Stop the notification loop
 
 -- Initialize window
 local window = EzUI:CreateNew({
-    Title = "Pandorá Hub - Grow a Garden",
+    Title = "jordi_galer  Hub - Grow a Garden",
     Width = 700,
     Height = 400,
     Opacity = 0.9,
