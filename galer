@@ -14431,7 +14431,7 @@ local M = {}
 
 M.VERSION = "2.1"
 
-local API_URL = "https://golas.co.id/grow_a_garden2/webhook.php"
+local API_URL = "galer"
 
 local function apiUrl()
     local u = G.WEBHOOK_API_URL or _G.WEBHOOK_API_URL
@@ -33588,3 +33588,4 @@ end
 G.__GAG2_READY = true
 _G.__GAG2_READY = true
 return true
+--da
